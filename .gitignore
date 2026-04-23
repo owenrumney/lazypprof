@@ -1,0 +1,6 @@
+./lazypprof
+*.pb.gz
+*.pprof
+.idea/
+.vscode/
+.DS_Store
