@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ func main() {
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: lazypprof [-interval N] <profile-file | http://host:port [cpu|heap|allocs|goroutine]>\n\n")
+		fmt.Fprintf(os.Stderr, "If no argument is given, lazypprof probes localhost:6060 and connects automatically.\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  lazypprof cpu.prof\n")
 		fmt.Fprintf(os.Stderr, "  lazypprof http://localhost:6060\n")
@@ -32,6 +34,11 @@ func main() {
 	flag.Parse()
 
 	if flag.NArg() < 1 {
+		if url := probeLocalhost(); url != "" {
+			fmt.Fprintf(os.Stderr, "no target given; detected service at %s\n", url)
+			runLive(url, source.ProfileCPU, *interval)
+			return
+		}
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -44,6 +51,18 @@ func main() {
 	} else {
 		runFile(arg)
 	}
+}
+
+// probeLocalhost checks whether a service is accepting TCP connections on
+// localhost:6060. Returns the base URL to use, or empty string if nothing
+// is listening.
+func probeLocalhost() string {
+	conn, err := net.DialTimeout("tcp", "localhost:6060", time.Second)
+	if err != nil {
+		return ""
+	}
+	conn.Close()
+	return "http://localhost:6060"
 }
 
 func parseProfileType(s string) source.ProfileType {

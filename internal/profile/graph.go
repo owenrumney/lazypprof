@@ -27,6 +27,8 @@ func (p *Profile) CallGraph(maxRoots int) []*Node {
 
 	// Synthetic root to collect all stacks under one parent.
 	root := &Node{}
+	// childIdx maps each node to a name→child lookup for O(1) insertion.
+	childIdx := make(map[*Node]map[string]*Node)
 
 	for _, s := range p.Raw.Sample {
 		if len(s.Location) == 0 {
@@ -42,10 +44,16 @@ func (p *Profile) CallGraph(maxRoots int) []*Node {
 
 		cur := root
 		for i, fn := range funcs {
-			child := findChild(cur, fn.name)
+			m := childIdx[cur]
+			if m == nil {
+				m = make(map[string]*Node)
+				childIdx[cur] = m
+			}
+			child := m[fn.name]
 			if child == nil {
 				child = &Node{Func: fn.name, File: fn.file}
 				cur.Children = append(cur.Children, child)
+				m[fn.name] = child
 			}
 			child.Cum += v
 			if i == len(funcs)-1 {
@@ -105,15 +113,6 @@ func stackFunctions(s *pp.Sample) []funcInfo {
 		}
 	}
 	return out
-}
-
-func findChild(parent *Node, name string) *Node {
-	for _, c := range parent.Children {
-		if c.Func == name {
-			return c
-		}
-	}
-	return nil
 }
 
 func sortNodes(nodes []*Node) {

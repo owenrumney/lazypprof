@@ -87,11 +87,12 @@ func truncate(s string, max int) string {
 	if max <= 0 {
 		return ""
 	}
-	if len(s) <= max {
+	runes := []rune(s)
+	if len(runes) <= max {
 		return s
 	}
 	if max == 1 {
 		return "…"
 	}
-	return s[:max-1] + "…"
+	return string(runes[:max-1]) + "…"
 }

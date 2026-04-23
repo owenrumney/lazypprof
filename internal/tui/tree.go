@@ -203,9 +203,18 @@ func (m *treeModel) view() string {
 		funcWidth = 20
 	}
 
-	var b strings.Builder
+	// First pass: build lines and find the longest one.
+	type viewLine struct {
+		text      string
+		separator bool // blank line before this row
+	}
+	lines := make([]viewLine, 0, end-m.offset)
+	maxLen := 0
 	for i := m.offset; i < end; i++ {
 		r := m.rows[i]
+
+		sep := r.depth == 0 && i > m.offset
+
 		indent := strings.Repeat("  ", r.depth)
 
 		marker := " "
@@ -218,21 +227,35 @@ func (m *treeModel) view() string {
 		}
 
 		pct := 100 * float64(r.node.Cum) / float64(m.total)
-		name := truncate(r.node.Func, funcWidth-len(indent))
+		name := truncate(r.node.Func, funcWidth-len([]rune(indent)))
 
 		line := fmt.Sprintf("%s%s %8d %5.1f%%  %s",
 			indent, marker, r.node.Cum, pct, name)
 
-		if i == m.cursor {
-			// Pad to full width so the highlight spans the row.
-			if len(line) < m.width {
-				line += strings.Repeat(" ", m.width-len(line))
+		if n := len([]rune(line)); n > maxLen {
+			maxLen = n
+		}
+		lines = append(lines, viewLine{text: line, separator: sep})
+	}
+
+	// Second pass: render with cursor padded to the longest line.
+	var b strings.Builder
+	b.WriteByte('\n') // gap between the header bar and first tree row
+	for i, vl := range lines {
+		if vl.separator {
+			b.WriteByte('\n')
+		}
+
+		line := vl.text
+		if m.offset+i == m.cursor {
+			if n := len([]rune(line)); n < maxLen {
+				line += strings.Repeat(" ", maxLen-n)
 			}
 			line = treeCursorStyle.Render(line)
 		}
 
 		b.WriteString(line)
-		if i < end-1 {
+		if i < len(lines)-1 {
 			b.WriteByte('\n')
 		}
 	}

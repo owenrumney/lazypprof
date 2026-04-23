@@ -385,7 +385,8 @@ func shortenFunc(name string, width int) string {
 	if width < 1 {
 		return ""
 	}
-	if len(name) <= width {
+	runes := []rune(name)
+	if len(runes) <= width {
 		return name
 	}
 
@@ -393,15 +394,16 @@ func shortenFunc(name string, width int) string {
 	// 1. Drop the package path, keep type.Method
 	if idx := strings.LastIndex(name, "/"); idx >= 0 {
 		short := name[idx+1:]
-		if len(short) <= width {
+		shortRunes := []rune(short)
+		if len(shortRunes) <= width {
 			return short
 		}
-		name = short
+		runes = shortRunes
 	}
 
 	// 2. Truncate with ellipsis
 	if width <= 1 {
-		return string(name[0])
+		return string(runes[0])
 	}
-	return name[:width-1] + "…"
+	return string(runes[:width-1]) + "…"
 }

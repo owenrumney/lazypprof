@@ -40,6 +40,9 @@ func newGoroutineModel(p *profile.Profile) goroutineModel {
 }
 
 func (m *goroutineModel) rebuildGroups() {
+	if m.stateIdx >= len(m.allStates) {
+		m.stateIdx = -1 // state no longer present after refresh
+	}
 	if m.stateIdx < 0 {
 		m.groups = profile.GroupByState(m.goroutines)
 	} else {
@@ -195,6 +198,18 @@ func (m *goroutineModel) viewGroups() string {
 		return b.String()
 	}
 
+	// Find the longest header for consistent cursor width.
+	maxHeaderLen := 0
+	for _, g := range m.groups {
+		header := fmt.Sprintf("  %-20s %d goroutine", g.State, g.Count)
+		if g.Count != 1 {
+			header += "s"
+		}
+		if n := len([]rune(header)); n > maxHeaderLen {
+			maxHeaderLen = n
+		}
+	}
+
 	vis := m.visibleHeight()
 	linesUsed := 0
 
@@ -214,7 +229,7 @@ func (m *goroutineModel) viewGroups() string {
 		}
 
 		if isCursor {
-			header = padRight(header, m.width)
+			header = padRight(header, maxHeaderLen)
 			b.WriteString(lipgloss.NewStyle().
 				Background(selectBg).
 				Foreground(selectFg).
@@ -226,8 +241,15 @@ func (m *goroutineModel) viewGroups() string {
 		b.WriteByte('\n')
 		linesUsed++
 
-		// Show sample stack for the selected group.
+		// Show goroutine ID and sample stack for the selected group.
 		if isCursor && len(g.Goroutines) > 0 {
+			idLine := fmt.Sprintf("    goroutine %d", g.Goroutines[0].ID)
+			if len(g.Goroutines) > 1 {
+				idLine += fmt.Sprintf(" (sample of %d)", len(g.Goroutines))
+			}
+			b.WriteString(goroutineStackStyle.Render(idLine))
+			b.WriteByte('\n')
+			linesUsed++
 			linesUsed += m.renderStack(&b, g.Goroutines[0].Stack, vis-linesUsed)
 		}
 	}
@@ -248,6 +270,19 @@ func (m *goroutineModel) viewDrillDown() string {
 	b.WriteString(goroutineHeaderStyle.Render(headerLine))
 	b.WriteByte('\n')
 	b.WriteByte('\n')
+
+	// Find the longest header for consistent cursor width.
+	maxHeaderLen := 0
+	for _, sg := range m.stackGroups {
+		topFunc := ""
+		if len(sg.Stack) > 0 {
+			topFunc = sg.Stack[0].Func
+		}
+		header := fmt.Sprintf("  %d× %s", sg.Count, topFunc)
+		if n := len([]rune(header)); n > maxHeaderLen {
+			maxHeaderLen = n
+		}
+	}
 
 	vis := m.visibleHeight()
 	linesUsed := 0
@@ -270,7 +305,7 @@ func (m *goroutineModel) viewDrillDown() string {
 		header := fmt.Sprintf("  %d× %s", sg.Count, topFunc)
 
 		if isCursor {
-			header = padRight(header, m.width)
+			header = padRight(header, maxHeaderLen)
 			b.WriteString(lipgloss.NewStyle().
 				Background(selectBg).
 				Foreground(selectFg).
@@ -282,8 +317,11 @@ func (m *goroutineModel) viewDrillDown() string {
 		b.WriteByte('\n')
 		linesUsed++
 
-		// Show full stack for the selected stack group.
+		// Show goroutine IDs and full stack for the selected stack group.
 		if isCursor {
+			b.WriteString(goroutineStackStyle.Render(truncate("    goroutines: "+formatIDs(sg.IDs), m.width)))
+			b.WriteByte('\n')
+			linesUsed++
 			linesUsed += m.renderStack(&b, sg.Stack, vis-linesUsed)
 		}
 	}
@@ -293,11 +331,10 @@ func (m *goroutineModel) viewDrillDown() string {
 
 func (m *goroutineModel) renderStack(b *strings.Builder, stack []profile.StackFrame, maxLines int) int {
 	lines := 0
-	for i, frame := range stack {
+	for _, frame := range stack {
 		if lines >= maxLines {
 			break
 		}
-		_ = i
 		line := fmt.Sprintf("      %s", frame.Func)
 		if frame.File != "" {
 			line += fmt.Sprintf("  %s:%d", frame.File, frame.Line)
@@ -309,9 +346,19 @@ func (m *goroutineModel) renderStack(b *strings.Builder, stack []profile.StackFr
 	return lines
 }
 
+// formatIDs renders a list of goroutine IDs as a comma-separated string.
+func formatIDs(ids []int) string {
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = fmt.Sprintf("%d", id)
+	}
+	return strings.Join(parts, ", ")
+}
+
 func padRight(s string, width int) string {
-	if len(s) >= width {
+	runes := []rune(s)
+	if len(runes) >= width {
 		return s
 	}
-	return s + strings.Repeat(" ", width-len(s))
+	return s + strings.Repeat(" ", width-len(runes))
 }

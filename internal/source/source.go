@@ -106,10 +106,11 @@ func NewPoller(src *HTTPSource, interval time.Duration) *Poller {
 	}
 }
 
-// Run starts polling. Blocks until ctx is cancelled.
+// Run starts polling. Blocks until ctx is cancelled. Closes p.C on exit.
 func (p *Poller) Run(ctx context.Context) {
 	ticker := time.NewTicker(p.Interval)
 	defer ticker.Stop()
+	defer close(p.C)
 
 	// Fetch immediately on start.
 	if prof, err := p.Source.Load(); err == nil {

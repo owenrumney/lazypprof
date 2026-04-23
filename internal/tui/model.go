@@ -42,6 +42,7 @@ func (v view) String() string {
 // profileRefreshMsg is sent when a new profile arrives from live mode.
 type profileRefreshMsg struct {
 	prof *profile.Profile
+	gen  uint64 // generation at the time the wait was registered
 }
 
 // modeSwitchMsg is sent when a mode switch completes (new profile type fetched).
@@ -50,6 +51,11 @@ type modeSwitchMsg struct {
 	refreshC <-chan *profile.Profile
 	cancel   context.CancelFunc
 	pt       source.ProfileType
+}
+
+// modeSwitchErrMsg is sent when a mode switch fails.
+type modeSwitchErrMsg struct {
+	err error
 }
 
 // Model is the root Bubble Tea model.
@@ -77,15 +83,20 @@ type Model struct {
 	// Live mode switching.
 	liveConfig   *LiveConfig
 	pollerCancel context.CancelFunc // cancel current poller
+	refreshGen   uint64             // incremented on mode switch; drops stale refresh messages
 	switching    string             // non-empty = "Switching to <type>..." overlay
 	modePicker   bool               // true = mode picker overlay visible
 	modePickIdx  int                // cursor in AllProfileTypes
+
+	// Pause.
+	paused      bool
+	pendingProf *profile.Profile // latest profile received while paused
 }
 
 // LiveConfig holds the parameters needed to switch profile types at runtime.
 type LiveConfig struct {
 	BaseURL     string
-	Interval    time.Duration
+	Interval    time.Duration // 0 = auto-select based on ProfileType via source.DefaultInterval
 	ProfileType source.ProfileType
 }
 
@@ -149,23 +160,37 @@ func (m Model) Init() tea.Cmd {
 }
 
 func (m Model) waitForRefresh() tea.Cmd {
+	gen := m.refreshGen
+	c := m.refreshC
 	return func() tea.Msg {
-		p, ok := <-m.refreshC
+		p, ok := <-c
 		if !ok {
 			return nil
 		}
-		return profileRefreshMsg{prof: p}
+		return profileRefreshMsg{prof: p, gen: gen}
 	}
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case profileRefreshMsg:
+		if msg.gen != m.refreshGen {
+			return m, nil // stale message from a previous mode's poller; discard
+		}
+		if m.paused {
+			m.pendingProf = msg.prof // stash; apply when resumed
+			return m, m.waitForRefresh()
+		}
 		m.refreshProfile(msg.prof)
 		return m, m.waitForRefresh()
 
+	case modeSwitchErrMsg:
+		m.switching = ""
+		return m, nil
+
 	case modeSwitchMsg:
 		m.switching = ""
+		m.refreshGen++ // invalidate any in-flight profileRefreshMsg from old poller
 		// Cancel old poller, wire up new one.
 		if m.pollerCancel != nil {
 			m.pollerCancel()
@@ -221,6 +246,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "?":
 			m.showHelp = true
 			return m, nil
+		case "p":
+			if m.refreshC != nil {
+				m.paused = !m.paused
+				if !m.paused && m.pendingProf != nil {
+					m.refreshProfile(m.pendingProf)
+					m.pendingProf = nil
+				}
+				return m, nil
+			}
 		case "m":
 			if m.liveConfig != nil && m.switching == "" {
 				m.modePicker = true
@@ -319,8 +353,11 @@ func (m Model) View() string {
 		extraStr = " │ " + strings.Join(extras, " │ ")
 	}
 	keys := "[tab] [/] [?] [q]"
+	if m.refreshC != nil {
+		keys = "[tab] [p] [/] [?] [q]"
+	}
 	if m.liveConfig != nil {
-		keys = "[tab] [m] [/] [?] [q]"
+		keys = "[tab] [m] [p] [/] [?] [q]"
 	}
 	header := headerStyle.Render(fmt.Sprintf(
 		" lazypprof │ %s │ %s (%s)%s │ %s ",
@@ -358,6 +395,11 @@ func (m Model) View() string {
 
 	if m.filtering {
 		body = lipgloss.JoinVertical(lipgloss.Left, body, m.filterInp.View())
+	}
+
+	if m.paused {
+		banner := pauseBannerStyle.Width(m.width).Render("⏸  PAUSED — updates suspended  [p] to resume")
+		body = lipgloss.JoinVertical(lipgloss.Left, banner, body)
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, body)
@@ -519,7 +561,7 @@ func (m *Model) switchModeTo(pt source.ProfileType) tea.Cmd {
 		httpSrc := source.NewHTTPSource(cfg.BaseURL, pt)
 		prof, err := httpSrc.Load()
 		if err != nil {
-			return nil
+			return modeSwitchErrMsg{err: err}
 		}
 
 		interval := cfg.Interval

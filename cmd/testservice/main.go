@@ -29,6 +29,7 @@ func main() {
 	fmt.Println("  /debug/pprof/profile?seconds=5  (CPU)")
 	fmt.Println("  /debug/pprof/heap               (heap)")
 	fmt.Println("  /debug/pprof/allocs             (allocs)")
+	fmt.Println("  /debug/pprof/goroutine?debug=2  (goroutines)")
 
 	// Spin up background work to generate interesting profiles.
 	go mathLoop()

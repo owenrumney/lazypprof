@@ -1,6 +1,7 @@
 package source_test
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -102,6 +103,42 @@ func TestDefaultInterval(t *testing.T) {
 	assert.Equal(t, 10*time.Second, source.DefaultInterval(source.ProfileCPU))
 	assert.Equal(t, 5*time.Second, source.DefaultInterval(source.ProfileHeap))
 	assert.Equal(t, 5*time.Second, source.DefaultInterval(source.ProfileAllocs))
+	assert.Equal(t, 5*time.Second, source.DefaultInterval(source.ProfileGoroutine))
+}
+
+func TestNewHTTPSource_Goroutine(t *testing.T) {
+	src := source.NewHTTPSource("http://localhost:6060", source.ProfileGoroutine)
+	assert.Equal(t, "http://localhost:6060/debug/pprof/goroutine?debug=2", src.URL)
+}
+
+const minimalGoroutineText = `goroutine 1 [running]:
+main.main()
+	/home/user/app/main.go:10 +0x1a0
+
+goroutine 2 [IO wait]:
+net.(*netFD).Read(0x14000120180, {0x14000148000, 0x1000, 0x1000})
+	/usr/local/go/src/net/fd_posix.go:55 +0x28
+
+`
+
+func TestHTTPSource_Load_Goroutine(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(minimalGoroutineText))
+	}))
+	defer srv.Close()
+
+	src := &source.HTTPSource{
+		URL:         srv.URL,
+		Client:      srv.Client(),
+		ProfileType: source.ProfileGoroutine,
+	}
+
+	p, err := src.Load()
+	require.NoError(t, err)
+	assert.NotNil(t, p.Raw)
+	assert.Len(t, p.Goroutines, 2)
+	assert.Equal(t, "running", p.Goroutines[0].State)
+	assert.Equal(t, "IO wait", p.Goroutines[1].State)
 }
 
 func TestPoller_DeliversProfile(t *testing.T) {
@@ -148,13 +185,9 @@ func buildTestProfileFile(t *testing.T) string {
 func buildTestProfileBytes(t *testing.T) []byte {
 	t.Helper()
 	raw := minimalProfile()
-	f, err := os.CreateTemp(t.TempDir(), "test-*.prof")
-	require.NoError(t, err)
-	require.NoError(t, raw.Write(f))
-	require.NoError(t, f.Close())
-	data, err := os.ReadFile(f.Name())
-	require.NoError(t, err)
-	return data
+	var buf bytes.Buffer
+	require.NoError(t, raw.Write(&buf))
+	return buf.Bytes()
 }
 
 func minimalProfile() *pp.Profile {
