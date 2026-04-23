@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"hash/fnv"
+	"regexp"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -28,6 +29,7 @@ type flameModel struct {
 	cursor   int          // index into frames
 	zoomRoot *profile.Node
 	zoomHist []*profile.Node // stack for backspace
+	filterRe *regexp.Regexp
 }
 
 func newFlameModel(p *profile.Profile) flameModel {
@@ -72,6 +74,9 @@ func (m *flameModel) layout() {
 func (m *flameModel) layoutChildren(nodes []*profile.Node, x, depth, totalWidth int, rootTotal int64) {
 	cx := x
 	for _, n := range nodes {
+		if n.Cum <= 0 {
+			continue
+		}
 		w := int(float64(totalWidth) * float64(n.Cum) / float64(rootTotal))
 		if w < 1 {
 			w = 1
@@ -288,6 +293,7 @@ func (m *flameModel) view() string {
 		ch    rune
 		color int
 		focus bool
+		dim   bool
 	}
 
 	grid := make([][]cell, rowCount)
@@ -310,6 +316,7 @@ func (m *flameModel) view() string {
 			continue
 		}
 		isFocused := fi == m.cursor
+		dimmed := m.filterRe != nil && !m.filterRe.MatchString(f.node.Func)
 
 		label := f.label
 		labelRunes := []rune(label)
@@ -324,6 +331,7 @@ func (m *flameModel) view() string {
 				ch:    ch,
 				color: f.colorIndex,
 				focus: isFocused,
+				dim:   dimmed,
 			}
 		}
 	}
@@ -336,7 +344,7 @@ func (m *flameModel) view() string {
 			// Find a run of cells with the same style.
 			startCol := col
 			c := row[col]
-			for col < len(row) && row[col].color == c.color && row[col].focus == c.focus {
+			for col < len(row) && row[col].color == c.color && row[col].focus == c.focus && row[col].dim == c.dim {
 				col++
 			}
 
@@ -355,6 +363,9 @@ func (m *flameModel) view() string {
 					style = style.Background(selectBg).
 						Foreground(selectFg).
 						Bold(true)
+				} else if c.dim {
+					style = style.Background(subtleColor).
+						Foreground(textColor)
 				} else {
 					style = style.Background(flameColors[c.color]).
 						Foreground(textColor)

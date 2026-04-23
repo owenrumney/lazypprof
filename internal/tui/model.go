@@ -91,6 +91,10 @@ type Model struct {
 	// Pause.
 	paused      bool
 	pendingProf *profile.Profile // latest profile received while paused
+
+	// Diff mode.
+	diffMode bool
+	diffTop  diffTopView
 }
 
 // LiveConfig holds the parameters needed to switch profile types at runtime.
@@ -106,6 +110,8 @@ var AllProfileTypes = []source.ProfileType{
 	source.ProfileHeap,
 	source.ProfileAllocs,
 	source.ProfileGoroutine,
+	source.ProfileMutex,
+	source.ProfileBlock,
 }
 
 // New constructs a Model for the given profile. Pass a non-nil channel for
@@ -142,6 +148,14 @@ func WithLiveConfig(cfg *LiveConfig, cancel context.CancelFunc) Option {
 	return func(m *Model) {
 		m.liveConfig = cfg
 		m.pollerCancel = cancel
+	}
+}
+
+// WithDiffMode marks this model as showing a diff between two profiles.
+func WithDiffMode() Option {
+	return func(m *Model) {
+		m.diffMode = true
+		m.diffTop = newDiffTopView(m.prof, nil)
 	}
 }
 
@@ -206,6 +220,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.topTbl.SetWidth(msg.Width - 2)
 		m.topTbl.SetHeight(msg.Height - 4)
+		m.diffTop.setSize(msg.Width-2, msg.Height-4)
 		m.tree.setSize(msg.Width-2, msg.Height-4)
 		m.flame.setSize(msg.Width-2, msg.Height-4)
 		m.goroutine.setSize(msg.Width-2, msg.Height-4)
@@ -275,6 +290,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Delegate view-local keys.
+		if m.view == viewTop && m.diffMode {
+			m.handleDiffTopKey(msg)
+			return m, nil
+		}
 		if m.view == viewTree {
 			m.handleTreeKey(msg)
 			return m, nil
@@ -328,6 +347,15 @@ func (m *Model) applyFilter() {
 	m.topTbl = newTopTableFiltered(m.prof, m.filterRe)
 	m.topTbl.SetWidth(m.width - 2)
 	m.topTbl.SetHeight(m.height - 4)
+	if m.diffMode {
+		m.diffTop = newDiffTopView(m.prof, m.filterRe)
+		m.diffTop.setSize(m.width-2, m.height-4)
+	}
+	m.tree.filterRe = m.filterRe
+	m.tree.computeMatches()
+	m.tree.expandToMatches()
+	m.flame.filterRe = m.filterRe
+	m.goroutine.filterRe = m.filterRe
 }
 
 func (m *Model) clearFilter() {
@@ -336,11 +364,22 @@ func (m *Model) clearFilter() {
 	m.topTbl = newTopTable(m.prof)
 	m.topTbl.SetWidth(m.width - 2)
 	m.topTbl.SetHeight(m.height - 4)
+	if m.diffMode {
+		m.diffTop = newDiffTopView(m.prof, nil)
+		m.diffTop.setSize(m.width-2, m.height-4)
+	}
+	m.tree.filterRe = nil
+	m.tree.matched = nil
+	m.tree.onPath = nil
+	m.flame.filterRe = nil
+	m.goroutine.filterRe = nil
 }
 
 func (m Model) View() string {
 	var extras []string
-	if m.liveConfig != nil {
+	if m.diffMode {
+		extras = append(extras, "diff")
+	} else if m.liveConfig != nil {
 		extras = append(extras, "live:"+string(m.liveConfig.ProfileType))
 	} else if m.refreshC != nil {
 		extras = append(extras, "live")
@@ -381,10 +420,21 @@ func (m Model) View() string {
 		return lipgloss.JoinVertical(lipgloss.Left, header, overlay)
 	}
 
+	if m.prof.Empty() {
+		if hint := m.emptyProfileHint(); hint != "" {
+			body := placeholderStyle.Padding(2, 4).Render(hint)
+			return lipgloss.JoinVertical(lipgloss.Left, header, body)
+		}
+	}
+
 	var body string
 	switch m.view {
 	case viewTop:
-		body = m.topTbl.View()
+		if m.diffMode {
+			body = m.diffTop.view()
+		} else {
+			body = m.topTbl.View()
+		}
 	case viewTree:
 		body = m.tree.view()
 	case viewFlame:
@@ -403,6 +453,15 @@ func (m Model) View() string {
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, body)
+}
+
+func (m *Model) handleDiffTopKey(msg tea.KeyMsg) {
+	switch msg.String() {
+	case "up", "k":
+		m.diffTop.moveUp()
+	case "down", "j":
+		m.diffTop.moveDown()
+	}
 }
 
 func (m *Model) handleTreeKey(msg tea.KeyMsg) {
@@ -456,9 +515,9 @@ func (m *Model) handleFlameKey(msg tea.KeyMsg) {
 	case "right", "l":
 		m.flame.moveRight()
 	case "up", "k":
-		m.flame.moveUp()
-	case "down", "j":
 		m.flame.moveDown()
+	case "down", "j":
+		m.flame.moveUp()
 	case "enter":
 		m.flame.zoomIn()
 	case "backspace":
@@ -491,14 +550,19 @@ func (m *Model) rebuildViews() {
 	m.topTbl.SetWidth(m.width - 2)
 	m.topTbl.SetHeight(m.height - 4)
 	m.tree = newTreeModel(m.prof)
+	m.tree.filterRe = m.filterRe
+	m.tree.computeMatches()
+	m.tree.expandToMatches()
 	m.tree.setSize(m.width-2, m.height-4)
 	newFlame := newFlameModel(m.prof)
 	newFlame.zoomRoot = m.flame.zoomRoot
 	newFlame.zoomHist = m.flame.zoomHist
+	newFlame.filterRe = m.filterRe
 	m.flame = newFlame
 	m.flame.setSize(m.width-2, m.height-4)
 	oldGoroutine := m.goroutine
 	m.goroutine = newGoroutineModel(m.prof)
+	m.goroutine.filterRe = m.filterRe
 	m.goroutine.stateIdx = oldGoroutine.stateIdx
 	m.goroutine.rebuildGroups()
 	m.goroutine.setSize(m.width-2, m.height-4)
@@ -617,6 +681,20 @@ func (m Model) modePickerView() string {
 	b.WriteString("\n")
 	b.WriteString(lipgloss.NewStyle().Foreground(subtleColor).Render("  enter: select  esc: cancel"))
 	return b.String()
+}
+
+func (m Model) emptyProfileHint() string {
+	if m.liveConfig == nil {
+		return "No sample data in this profile."
+	}
+	switch m.liveConfig.ProfileType {
+	case source.ProfileMutex:
+		return "No mutex contention data.\nIs runtime.SetMutexProfileFraction() enabled in the target service?"
+	case source.ProfileBlock:
+		return "No block profile data.\nIs runtime.SetBlockProfileRate() enabled in the target service?"
+	default:
+		return "No sample data in this profile."
+	}
 }
 
 func (m *Model) cycleSampleType() {

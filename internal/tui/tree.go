@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -27,6 +28,11 @@ type treeModel struct {
 
 	// Track which nodes are expanded by identity (pointer).
 	open map[*profile.Node]bool
+
+	// Filter highlighting.
+	filterRe *regexp.Regexp
+	matched  map[*profile.Node]bool // nodes whose Func matches the filter
+	onPath   map[*profile.Node]bool // ancestors of a matched node
 
 	width  int
 	height int
@@ -146,6 +152,58 @@ func (m *treeModel) expandAll(n *profile.Node) {
 	}
 }
 
+// computeMatches walks the tree and marks nodes that match the filter regex,
+// plus their ancestors (onPath) so we can auto-expand to them.
+func (m *treeModel) computeMatches() {
+	m.matched = nil
+	m.onPath = nil
+	if m.filterRe == nil {
+		return
+	}
+	m.matched = make(map[*profile.Node]bool)
+	m.onPath = make(map[*profile.Node]bool)
+	for _, r := range m.roots {
+		m.markMatches(r)
+	}
+}
+
+func (m *treeModel) markMatches(n *profile.Node) bool {
+	direct := m.filterRe.MatchString(n.Func)
+	if direct {
+		m.matched[n] = true
+	}
+	childMatch := false
+	for _, c := range n.Children {
+		if m.markMatches(c) {
+			childMatch = true
+		}
+	}
+	if childMatch {
+		m.onPath[n] = true
+	}
+	return direct || childMatch
+}
+
+// expandToMatches auto-expands all paths leading to matched nodes.
+func (m *treeModel) expandToMatches() {
+	if m.filterRe == nil {
+		return
+	}
+	for _, r := range m.roots {
+		m.expandIfOnPath(r)
+	}
+	m.rebuild()
+}
+
+func (m *treeModel) expandIfOnPath(n *profile.Node) {
+	if m.onPath[n] || m.matched[n] {
+		m.open[n] = true
+		for _, c := range n.Children {
+			m.expandIfOnPath(c)
+		}
+	}
+}
+
 func (m *treeModel) moveUp() {
 	if m.cursor > 0 {
 		m.cursor--
@@ -187,6 +245,13 @@ var treeCursorStyle = lipgloss.NewStyle().
 	Background(selectBg).
 	Foreground(selectFg)
 
+var treeMatchStyle = lipgloss.NewStyle().
+	Foreground(accentColor).
+	Bold(true)
+
+var treeDimStyle = lipgloss.NewStyle().
+	Foreground(subtleColor)
+
 func (m *treeModel) view() string {
 	if len(m.rows) == 0 {
 		return placeholderStyle.Render("\n  No call graph data\n")
@@ -206,7 +271,8 @@ func (m *treeModel) view() string {
 	// First pass: build lines and find the longest one.
 	type viewLine struct {
 		text      string
-		separator bool // blank line before this row
+		separator bool           // blank line before this row
+		node      *profile.Node  // for filter highlighting
 	}
 	lines := make([]viewLine, 0, end-m.offset)
 	maxLen := 0
@@ -235,7 +301,7 @@ func (m *treeModel) view() string {
 		if n := len([]rune(line)); n > maxLen {
 			maxLen = n
 		}
-		lines = append(lines, viewLine{text: line, separator: sep})
+		lines = append(lines, viewLine{text: line, separator: sep, node: r.node})
 	}
 
 	// Second pass: render with cursor padded to the longest line.
@@ -252,6 +318,12 @@ func (m *treeModel) view() string {
 				line += strings.Repeat(" ", maxLen-n)
 			}
 			line = treeCursorStyle.Render(line)
+		} else if m.filterRe != nil {
+			if m.matched[vl.node] {
+				line = treeMatchStyle.Render(line)
+			} else if !m.onPath[vl.node] {
+				line = treeDimStyle.Render(line)
+			}
 		}
 
 		b.WriteString(line)

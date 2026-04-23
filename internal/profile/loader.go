@@ -44,6 +44,20 @@ func Load(path string) (*Profile, error) {
 	return &Profile{Raw: p, SampleType: sampleType}, nil
 }
 
+// Empty reports whether the profile contains no meaningful sample data.
+func (p *Profile) Empty() bool {
+	idx := p.sampleIndex()
+	if idx < 0 {
+		return true
+	}
+	for _, s := range p.Raw.Sample {
+		if s.Value[idx] != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // FunctionStat is the per-function aggregate displayed in the Top view.
 type FunctionStat struct {
 	Name string

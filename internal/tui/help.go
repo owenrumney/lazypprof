@@ -38,6 +38,7 @@ func (m Model) helpView() string {
 	if m.liveConfig != nil {
 		globalKeys = append([]helpEntry{
 			{"m", "Switch profile type (cpu/heap/allocs/goroutine)"},
+			{"p", "Pause/resume live refresh"},
 		}, globalKeys...)
 	}
 	section("Global", globalKeys)

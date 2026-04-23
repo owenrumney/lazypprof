@@ -104,11 +104,23 @@ func TestDefaultInterval(t *testing.T) {
 	assert.Equal(t, 5*time.Second, source.DefaultInterval(source.ProfileHeap))
 	assert.Equal(t, 5*time.Second, source.DefaultInterval(source.ProfileAllocs))
 	assert.Equal(t, 5*time.Second, source.DefaultInterval(source.ProfileGoroutine))
+	assert.Equal(t, 5*time.Second, source.DefaultInterval(source.ProfileMutex))
+	assert.Equal(t, 5*time.Second, source.DefaultInterval(source.ProfileBlock))
 }
 
 func TestNewHTTPSource_Goroutine(t *testing.T) {
 	src := source.NewHTTPSource("http://localhost:6060", source.ProfileGoroutine)
 	assert.Equal(t, "http://localhost:6060/debug/pprof/goroutine?debug=2", src.URL)
+}
+
+func TestNewHTTPSource_Mutex(t *testing.T) {
+	src := source.NewHTTPSource("http://localhost:6060", source.ProfileMutex)
+	assert.Equal(t, "http://localhost:6060/debug/pprof/mutex", src.URL)
+}
+
+func TestNewHTTPSource_Block(t *testing.T) {
+	src := source.NewHTTPSource("http://localhost:6060", source.ProfileBlock)
+	assert.Equal(t, "http://localhost:6060/debug/pprof/block", src.URL)
 }
 
 const minimalGoroutineText = `goroutine 1 [running]:

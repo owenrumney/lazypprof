@@ -1,5 +1,7 @@
-// Command mkprof generates a CPU profile with a non-trivial call graph.
-// Run: go run ./internal/testutil/mkprof.go -o /tmp/cpu.prof
+// Command mkprof generates CPU profiles with non-trivial call graphs.
+//
+//	go run ./cmd/mkprof -o cpu.prof
+//	go run ./cmd/mkprof -diff -o /tmp/prof    # writes /tmp/prof.base and /tmp/prof.target
 package main
 
 import (
@@ -13,12 +15,33 @@ import (
 	"sync"
 )
 
-var out = flag.String("o", "cpu.prof", "output file")
+var (
+	out  = flag.String("o", "cpu.prof", "output file (diff mode appends .base and .target)")
+	diff = flag.Bool("diff", false, "generate a base/target pair for diff testing")
+)
 
 func main() {
 	flag.Parse()
 
-	f, err := os.Create(*out)
+	if *diff {
+		runDiff()
+	} else {
+		runSingle(*out, 1.0)
+	}
+}
+
+func runDiff() {
+	base := *out + ".base"
+	target := *out + ".target"
+
+	runSingle(base, 1.0)
+	runSingle(target, 2.0)
+
+	fmt.Fprintf(os.Stderr, "\ndiff test:\n  lazypprof %s %s\n", base, target)
+}
+
+func runSingle(path string, scale float64) {
+	f, err := os.Create(path)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -32,18 +55,19 @@ func main() {
 
 	var wg sync.WaitGroup
 	wg.Add(4)
-	go func() { defer wg.Done(); heavyMath() }()
-	go func() { defer wg.Done(); stringWork() }()
-	go func() { defer wg.Done(); sortWork() }()
-	go func() { defer wg.Done(); allocWork() }()
+	go func() { defer wg.Done(); heavyMath(scale) }()
+	go func() { defer wg.Done(); stringWork(scale) }()
+	go func() { defer wg.Done(); sortWork(scale) }()
+	go func() { defer wg.Done(); allocWork(scale) }()
 	wg.Wait()
 
 	pprof.StopCPUProfile()
-	fmt.Fprintf(os.Stderr, "wrote %s\n", *out)
+	fmt.Fprintf(os.Stderr, "wrote %s\n", path)
 }
 
-func heavyMath() {
-	for i := 0; i < 5_000_000; i++ {
+func heavyMath(scale float64) {
+	n := int(5_000_000 * scale)
+	for i := 0; i < n; i++ {
 		sinkF = math.Sqrt(float64(i)) * math.Log(float64(i+1))
 		sinkF += trig(float64(i))
 	}
@@ -53,8 +77,9 @@ func trig(x float64) float64 {
 	return math.Sin(x) * math.Cos(x) * math.Tan(x/(math.Pi*1000)+1)
 }
 
-func stringWork() {
-	for i := 0; i < 200_000; i++ {
+func stringWork(scale float64) {
+	n := int(200_000 * scale)
+	for i := 0; i < n; i++ {
 		s := fmt.Sprintf("item-%d-payload-%d", i, i*31)
 		s = strings.ToUpper(s)
 		s = strings.ReplaceAll(s, "PAYLOAD", "DATA")
@@ -70,8 +95,9 @@ func reverseString(s string) string {
 	return string(r)
 }
 
-func sortWork() {
-	for i := 0; i < 100; i++ {
+func sortWork(scale float64) {
+	n := int(100 * scale)
+	for i := 0; i < n; i++ {
 		data := makeData(50_000)
 		sort.Ints(data)
 		sinkI = data[0]
@@ -86,8 +112,9 @@ func makeData(n int) []int {
 	return d
 }
 
-func allocWork() {
-	for i := 0; i < 500_000; i++ {
+func allocWork(scale float64) {
+	n := int(500_000 * scale)
+	for i := 0; i < n; i++ {
 		b := make([]byte, 256)
 		for j := range b {
 			b[j] = byte(j ^ i)

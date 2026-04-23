@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -22,6 +23,9 @@ type goroutineModel struct {
 	drillState  string               // which state we drilled into
 	stackCursor int
 	stackOffset int
+
+	// Filter highlighting.
+	filterRe *regexp.Regexp
 
 	cursor int
 	offset int
@@ -339,7 +343,12 @@ func (m *goroutineModel) renderStack(b *strings.Builder, stack []profile.StackFr
 		if frame.File != "" {
 			line += fmt.Sprintf("  %s:%d", frame.File, frame.Line)
 		}
-		b.WriteString(goroutineStackStyle.Render(truncate(line, m.width)))
+		line = truncate(line, m.width)
+		if m.filterRe != nil && m.filterRe.MatchString(frame.Func) {
+			b.WriteString(treeMatchStyle.Render(line))
+		} else {
+			b.WriteString(goroutineStackStyle.Render(line))
+		}
 		b.WriteByte('\n')
 		lines++
 	}

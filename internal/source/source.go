@@ -44,6 +44,8 @@ const (
 	ProfileHeap      ProfileType = "heap"
 	ProfileAllocs    ProfileType = "allocs"
 	ProfileGoroutine ProfileType = "goroutine"
+	ProfileMutex     ProfileType = "mutex"
+	ProfileBlock     ProfileType = "block"
 )
 
 // pprofPath returns the /debug/pprof/... path for a profile type.
@@ -55,6 +57,10 @@ func (pt ProfileType) pprofPath() string {
 		return "/debug/pprof/allocs"
 	case ProfileGoroutine:
 		return "/debug/pprof/goroutine?debug=2"
+	case ProfileMutex:
+		return "/debug/pprof/mutex"
+	case ProfileBlock:
+		return "/debug/pprof/block"
 	default:
 		return "/debug/pprof/profile?seconds=5"
 	}
@@ -140,7 +146,7 @@ func (p *Poller) Run(ctx context.Context) {
 // DefaultInterval returns a sensible poll interval for the profile type.
 func DefaultInterval(pt ProfileType) time.Duration {
 	switch pt {
-	case ProfileHeap, ProfileAllocs, ProfileGoroutine:
+	case ProfileHeap, ProfileAllocs, ProfileGoroutine, ProfileMutex, ProfileBlock:
 		return 5 * time.Second
 	default:
 		return 10 * time.Second
