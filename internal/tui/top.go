@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"regexp"
 
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/lipgloss"
@@ -11,7 +12,24 @@ import (
 const topRowLimit = 200
 
 func newTopTable(p *profile.Profile) table.Model {
+	return buildTopTable(p, nil)
+}
+
+func newTopTableFiltered(p *profile.Profile, re *regexp.Regexp) table.Model {
+	return buildTopTable(p, re)
+}
+
+func buildTopTable(p *profile.Profile, filter *regexp.Regexp) table.Model {
 	stats := p.TopFunctions()
+	if filter != nil {
+		filtered := stats[:0:0]
+		for _, s := range stats {
+			if filter.MatchString(s.Name) {
+				filtered = append(filtered, s)
+			}
+		}
+		stats = filtered
+	}
 	if len(stats) > topRowLimit {
 		stats = stats[:topRowLimit]
 	}
@@ -66,8 +84,14 @@ func newTopTable(p *profile.Profile) table.Model {
 }
 
 func truncate(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
 	if len(s) <= max {
 		return s
+	}
+	if max == 1 {
+		return "…"
 	}
 	return s[:max-1] + "…"
 }

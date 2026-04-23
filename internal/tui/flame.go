@@ -241,6 +241,9 @@ func (m *flameModel) view() string {
 	if len(m.frames) == 0 {
 		return placeholderStyle.Render("\n  No flame graph data\n")
 	}
+	if m.width < 40 {
+		return placeholderStyle.Render("\n  Terminal too narrow for flame graph (need 40+ cols)\n")
+	}
 
 	// Find the max depth to determine how many rows we need.
 	maxDepth := 0

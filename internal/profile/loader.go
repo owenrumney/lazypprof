@@ -13,7 +13,8 @@ import (
 // Profile is a loaded pprof profile plus the currently selected sample type.
 type Profile struct {
 	Raw        *pp.Profile
-	SampleType string // e.g. "cpu", "inuse_space", "alloc_objects"
+	SampleType string       // e.g. "cpu", "inuse_space", "alloc_objects"
+	Goroutines []Goroutine  // populated for goroutine profiles (debug=2 parse)
 }
 
 // Load reads a pprof file (gzipped or not) from disk.

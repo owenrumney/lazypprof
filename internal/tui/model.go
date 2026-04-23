@@ -2,12 +2,18 @@
 package tui
 
 import (
+	"context"
 	"fmt"
+	"regexp"
+	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/owenrumney/lazypprof/internal/profile"
+	"github.com/owenrumney/lazypprof/internal/source"
 )
 
 type view int
@@ -16,7 +22,7 @@ const (
 	viewTop view = iota
 	viewTree
 	viewFlame
-	numViews
+	viewGoroutine
 )
 
 func (v view) String() string {
@@ -27,6 +33,8 @@ func (v view) String() string {
 		return "Tree"
 	case viewFlame:
 		return "Flame"
+	case viewGoroutine:
+		return "Goroutines"
 	}
 	return "?"
 }
@@ -36,29 +44,101 @@ type profileRefreshMsg struct {
 	prof *profile.Profile
 }
 
+// modeSwitchMsg is sent when a mode switch completes (new profile type fetched).
+type modeSwitchMsg struct {
+	prof     *profile.Profile
+	refreshC <-chan *profile.Profile
+	cancel   context.CancelFunc
+	pt       source.ProfileType
+}
+
 // Model is the root Bubble Tea model.
 type Model struct {
-	prof    *profile.Profile
-	view    view
-	width   int
-	height  int
-	topTbl  table.Model
-	tree    treeModel
-	flame   flameModel
-	refreshC <-chan *profile.Profile // nil for file mode
+	prof      *profile.Profile
+	view      view
+	views     []view // available views for this profile type
+	width     int
+	height    int
+	topTbl    table.Model
+	tree      treeModel
+	flame     flameModel
+	goroutine goroutineModel
+	refreshC  <-chan *profile.Profile // nil for file mode
+
+	// Filter bar.
+	filtering  bool
+	filterInp  textinput.Model
+	filterRe   *regexp.Regexp // nil = no active filter
+	filterText string         // display string for active filter
+
+	// Help overlay.
+	showHelp bool
+
+	// Live mode switching.
+	liveConfig   *LiveConfig
+	pollerCancel context.CancelFunc // cancel current poller
+	switching    string             // non-empty = "Switching to <type>..." overlay
+	modePicker   bool               // true = mode picker overlay visible
+	modePickIdx  int                // cursor in AllProfileTypes
+}
+
+// LiveConfig holds the parameters needed to switch profile types at runtime.
+type LiveConfig struct {
+	BaseURL     string
+	Interval    time.Duration
+	ProfileType source.ProfileType
+}
+
+// AllProfileTypes returns the available types in cycle order.
+var AllProfileTypes = []source.ProfileType{
+	source.ProfileCPU,
+	source.ProfileHeap,
+	source.ProfileAllocs,
+	source.ProfileGoroutine,
 }
 
 // New constructs a Model for the given profile. Pass a non-nil channel for
-// live mode to receive profile updates.
-func New(p *profile.Profile, refreshC <-chan *profile.Profile) Model {
-	return Model{
-		prof:     p,
-		view:     viewTop,
-		topTbl:   newTopTable(p),
-		tree:     newTreeModel(p),
-		flame:    newFlameModel(p),
-		refreshC: refreshC,
+// live mode to receive profile updates. Pass a non-nil LiveConfig to enable
+// mode switching with [m].
+func New(p *profile.Profile, refreshC <-chan *profile.Profile, opts ...Option) Model {
+	ti := textinput.New()
+	ti.Prompt = "/ "
+	ti.Placeholder = "regex filter..."
+	ti.CharLimit = 100
+
+	m := Model{
+		prof:      p,
+		topTbl:    newTopTable(p),
+		tree:      newTreeModel(p),
+		flame:     newFlameModel(p),
+		goroutine: newGoroutineModel(p),
+		refreshC:  refreshC,
+		filterInp: ti,
 	}
+	for _, opt := range opts {
+		opt(&m)
+	}
+	m.views = m.availableViews()
+	m.view = m.views[0]
+	return m
+}
+
+// Option configures the Model.
+type Option func(*Model)
+
+// WithLiveConfig enables mode switching in live mode.
+func WithLiveConfig(cfg *LiveConfig, cancel context.CancelFunc) Option {
+	return func(m *Model) {
+		m.liveConfig = cfg
+		m.pollerCancel = cancel
+	}
+}
+
+func (m *Model) availableViews() []view {
+	if len(m.prof.Goroutines) > 0 {
+		return []view{viewGoroutine, viewTop, viewTree, viewFlame}
+	}
+	return []view{viewTop, viewTree, viewFlame}
 }
 
 func (m Model) Init() tea.Cmd {
@@ -84,24 +164,80 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshProfile(msg.prof)
 		return m, m.waitForRefresh()
 
+	case modeSwitchMsg:
+		m.switching = ""
+		// Cancel old poller, wire up new one.
+		if m.pollerCancel != nil {
+			m.pollerCancel()
+		}
+		m.pollerCancel = msg.cancel
+		m.refreshC = msg.refreshC
+		m.liveConfig.ProfileType = msg.pt
+		m.prof = msg.prof
+		m.rebuildViews()
+		return m, m.waitForRefresh()
+
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.topTbl.SetWidth(msg.Width - 2)
 		m.topTbl.SetHeight(msg.Height - 4)
 		m.tree.setSize(msg.Width-2, msg.Height-4)
 		m.flame.setSize(msg.Width-2, msg.Height-4)
+		m.goroutine.setSize(msg.Width-2, msg.Height-4)
 		return m, nil
 
 	case tea.KeyMsg:
+		// Mode picker captures keys when open.
+		if m.modePicker {
+			return m.updateModePicker(msg)
+		}
+
+		// Filter input mode captures all keys.
+		if m.filtering {
+			return m.updateFilter(msg)
+		}
+
+		// Help overlay: any key dismisses.
+		if m.showHelp {
+			m.showHelp = false
+			return m, nil
+		}
+
+		// Global keys.
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "tab":
-			m.view = (m.view + 1) % numViews
+			m.cycleView()
 			return m, nil
 		case "s":
 			m.cycleSampleType()
 			return m, nil
+		case "/":
+			m.filtering = true
+			m.filterInp.SetValue("")
+			m.filterInp.Focus()
+			return m, textinput.Blink
+		case "?":
+			m.showHelp = true
+			return m, nil
+		case "m":
+			if m.liveConfig != nil && m.switching == "" {
+				m.modePicker = true
+				// Pre-select current type.
+				for i, pt := range AllProfileTypes {
+					if pt == m.liveConfig.ProfileType {
+						m.modePickIdx = i
+						break
+					}
+				}
+				return m, nil
+			}
+		case "esc", "escape":
+			if m.filterRe != nil {
+				m.clearFilter()
+				return m, nil
+			}
 		}
 
 		// Delegate view-local keys.
@@ -113,6 +249,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.handleFlameKey(msg)
 			return m, nil
 		}
+		if m.view == viewGoroutine {
+			m.handleGoroutineKey(msg)
+			return m, nil
+		}
 	}
 
 	var cmd tea.Cmd
@@ -120,15 +260,89 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m *Model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		m.filtering = false
+		m.filterInp.Blur()
+		text := m.filterInp.Value()
+		if text == "" {
+			m.clearFilter()
+		} else {
+			re, err := regexp.Compile("(?i)" + text)
+			if err != nil {
+				m.clearFilter()
+			} else {
+				m.filterRe = re
+				m.filterText = text
+				m.applyFilter()
+			}
+		}
+		return m, nil
+	case "esc", "escape":
+		m.filtering = false
+		m.filterInp.Blur()
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.filterInp, cmd = m.filterInp.Update(msg)
+	return m, cmd
+}
+
+func (m *Model) applyFilter() {
+	m.topTbl = newTopTableFiltered(m.prof, m.filterRe)
+	m.topTbl.SetWidth(m.width - 2)
+	m.topTbl.SetHeight(m.height - 4)
+}
+
+func (m *Model) clearFilter() {
+	m.filterRe = nil
+	m.filterText = ""
+	m.topTbl = newTopTable(m.prof)
+	m.topTbl.SetWidth(m.width - 2)
+	m.topTbl.SetHeight(m.height - 4)
+}
+
 func (m Model) View() string {
-	mode := ""
-	if m.refreshC != nil {
-		mode = " │ live"
+	var extras []string
+	if m.liveConfig != nil {
+		extras = append(extras, "live:"+string(m.liveConfig.ProfileType))
+	} else if m.refreshC != nil {
+		extras = append(extras, "live")
+	}
+	if m.filterText != "" {
+		extras = append(extras, "filter: "+m.filterText)
+	}
+	extraStr := ""
+	if len(extras) > 0 {
+		extraStr = " │ " + strings.Join(extras, " │ ")
+	}
+	keys := "[tab] [/] [?] [q]"
+	if m.liveConfig != nil {
+		keys = "[tab] [m] [/] [?] [q]"
 	}
 	header := headerStyle.Render(fmt.Sprintf(
-		" lazypprof │ view: %s │ sample: %s (%s)%s │ [tab] view  [s] sample  [q] quit ",
-		m.view, m.prof.SampleType, m.prof.Unit(), mode,
+		" lazypprof │ %s │ %s (%s)%s │ %s ",
+		m.view, m.prof.SampleType, m.prof.Unit(), extraStr, keys,
 	))
+
+	if m.showHelp {
+		return lipgloss.JoinVertical(lipgloss.Left, header, m.helpView())
+	}
+
+	if m.modePicker {
+		return lipgloss.JoinVertical(lipgloss.Left, header, m.modePickerView())
+	}
+
+	if m.switching != "" {
+		overlay := lipgloss.NewStyle().
+			Foreground(accentColor).
+			Bold(true).
+			Padding(2, 4).
+			Render(m.switching)
+		return lipgloss.JoinVertical(lipgloss.Left, header, overlay)
+	}
 
 	var body string
 	switch m.view {
@@ -138,6 +352,12 @@ func (m Model) View() string {
 		body = m.tree.view()
 	case viewFlame:
 		body = m.flame.view()
+	case viewGoroutine:
+		body = m.goroutine.view()
+	}
+
+	if m.filtering {
+		body = lipgloss.JoinVertical(lipgloss.Left, body, m.filterInp.View())
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, body)
@@ -159,6 +379,31 @@ func (m *Model) handleTreeKey(msg tea.KeyMsg) {
 		m.tree.collapseAll()
 	case "*":
 		m.tree.expandSubtree()
+	}
+}
+
+func (m *Model) cycleView() {
+	for i, v := range m.views {
+		if v == m.view {
+			m.view = m.views[(i+1)%len(m.views)]
+			return
+		}
+	}
+	m.view = m.views[0]
+}
+
+func (m *Model) handleGoroutineKey(msg tea.KeyMsg) {
+	switch msg.String() {
+	case "up", "k":
+		m.goroutine.moveUp()
+	case "down", "j":
+		m.goroutine.moveDown()
+	case "g":
+		m.goroutine.cycleState()
+	case "enter":
+		m.goroutine.enter()
+	case "backspace":
+		m.goroutine.back()
 	}
 }
 
@@ -196,7 +441,11 @@ func (m *Model) refreshProfile(p *profile.Profile) {
 }
 
 func (m *Model) rebuildViews() {
-	m.topTbl = newTopTable(m.prof)
+	if m.filterRe != nil {
+		m.topTbl = newTopTableFiltered(m.prof, m.filterRe)
+	} else {
+		m.topTbl = newTopTable(m.prof)
+	}
 	m.topTbl.SetWidth(m.width - 2)
 	m.topTbl.SetHeight(m.height - 4)
 	m.tree = newTreeModel(m.prof)
@@ -206,6 +455,126 @@ func (m *Model) rebuildViews() {
 	newFlame.zoomHist = m.flame.zoomHist
 	m.flame = newFlame
 	m.flame.setSize(m.width-2, m.height-4)
+	oldGoroutine := m.goroutine
+	m.goroutine = newGoroutineModel(m.prof)
+	m.goroutine.stateIdx = oldGoroutine.stateIdx
+	m.goroutine.rebuildGroups()
+	m.goroutine.setSize(m.width-2, m.height-4)
+	// Preserve drill-down: re-enter the same state if we were drilled in.
+	if oldGoroutine.drilled {
+		// Find the group matching the old drill state.
+		for i, g := range m.goroutine.groups {
+			if g.State == oldGoroutine.drillState {
+				m.goroutine.cursor = i
+				m.goroutine.enter()
+				break
+			}
+		}
+	}
+	m.views = m.availableViews()
+	// Ensure current view is still valid after the views list changed.
+	found := false
+	for _, v := range m.views {
+		if v == m.view {
+			found = true
+			break
+		}
+	}
+	if !found {
+		m.view = m.views[0]
+	}
+}
+
+func (m *Model) updateModePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up", "k":
+		if m.modePickIdx > 0 {
+			m.modePickIdx--
+		}
+		return m, nil
+	case "down", "j":
+		if m.modePickIdx < len(AllProfileTypes)-1 {
+			m.modePickIdx++
+		}
+		return m, nil
+	case "enter":
+		selected := AllProfileTypes[m.modePickIdx]
+		m.modePicker = false
+		if selected == m.liveConfig.ProfileType {
+			return m, nil // no change
+		}
+		m.switching = fmt.Sprintf("Switching to %s...", selected)
+		return m, m.switchModeTo(selected)
+	case "esc", "escape", "q", "m":
+		m.modePicker = false
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m *Model) switchModeTo(pt source.ProfileType) tea.Cmd {
+	cfg := m.liveConfig
+
+	return func() tea.Msg {
+		httpSrc := source.NewHTTPSource(cfg.BaseURL, pt)
+		prof, err := httpSrc.Load()
+		if err != nil {
+			return nil
+		}
+
+		interval := cfg.Interval
+		if interval == 0 {
+			interval = source.DefaultInterval(pt)
+		}
+		poller := source.NewPoller(httpSrc, interval)
+		ctx, cancel := context.WithCancel(context.Background())
+		go poller.Run(ctx)
+
+		return modeSwitchMsg{
+			prof:     prof,
+			refreshC: poller.C,
+			cancel:   cancel,
+			pt:       pt,
+		}
+	}
+}
+
+func (m Model) modePickerView() string {
+	var b strings.Builder
+	b.WriteString("\n")
+	b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(accentColor).Render("  Select profile type"))
+	b.WriteString("\n\n")
+
+	for i, pt := range AllProfileTypes {
+		cursor := "  "
+		if i == m.modePickIdx {
+			cursor = "▸ "
+		}
+
+		label := fmt.Sprintf("%s%s", cursor, pt)
+		if pt == m.liveConfig.ProfileType {
+			label += " (current)"
+		}
+
+		if i == m.modePickIdx {
+			label = padRight(label, 40)
+			b.WriteString(lipgloss.NewStyle().
+				Background(selectBg).
+				Foreground(selectFg).
+				Bold(true).
+				Render(label))
+		} else {
+			b.WriteString("  " + string(pt))
+			if pt == m.liveConfig.ProfileType {
+				b.WriteString(lipgloss.NewStyle().Foreground(subtleColor).Render(" (current)"))
+			}
+		}
+		b.WriteByte('\n')
+	}
+
+	b.WriteString("\n")
+	b.WriteString(lipgloss.NewStyle().Foreground(subtleColor).Render("  enter: select  esc: cancel"))
+	return b.String()
 }
 
 func (m *Model) cycleSampleType() {

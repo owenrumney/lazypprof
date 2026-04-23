@@ -31,17 +31,19 @@ func (s *FileSource) Load() (*profile.Profile, error) {
 
 // HTTPSource polls a /debug/pprof endpoint for profiles.
 type HTTPSource struct {
-	URL    string
-	Client *http.Client
+	URL         string
+	Client      *http.Client
+	ProfileType ProfileType
 }
 
 // ProfileType selects which pprof endpoint to hit.
 type ProfileType string
 
 const (
-	ProfileCPU    ProfileType = "cpu"
-	ProfileHeap   ProfileType = "heap"
-	ProfileAllocs ProfileType = "allocs"
+	ProfileCPU       ProfileType = "cpu"
+	ProfileHeap      ProfileType = "heap"
+	ProfileAllocs    ProfileType = "allocs"
+	ProfileGoroutine ProfileType = "goroutine"
 )
 
 // pprofPath returns the /debug/pprof/... path for a profile type.
@@ -51,6 +53,8 @@ func (pt ProfileType) pprofPath() string {
 		return "/debug/pprof/heap"
 	case ProfileAllocs:
 		return "/debug/pprof/allocs"
+	case ProfileGoroutine:
+		return "/debug/pprof/goroutine?debug=2"
 	default:
 		return "/debug/pprof/profile?seconds=5"
 	}
@@ -60,7 +64,8 @@ func (pt ProfileType) pprofPath() string {
 func NewHTTPSource(baseURL string, pt ProfileType) *HTTPSource {
 	base := strings.TrimRight(baseURL, "/")
 	return &HTTPSource{
-		URL: base + pt.pprofPath(),
+		URL:         base + pt.pprofPath(),
+		ProfileType: pt,
 		Client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -78,6 +83,9 @@ func (s *HTTPSource) Load() (*profile.Profile, error) {
 		return nil, fmt.Errorf("http %d from %s", resp.StatusCode, s.URL)
 	}
 
+	if s.ProfileType == ProfileGoroutine {
+		return parseGoroutineProfile(resp.Body)
+	}
 	return parseProfile(resp.Body)
 }
 
@@ -131,7 +139,7 @@ func (p *Poller) Run(ctx context.Context) {
 // DefaultInterval returns a sensible poll interval for the profile type.
 func DefaultInterval(pt ProfileType) time.Duration {
 	switch pt {
-	case ProfileHeap, ProfileAllocs:
+	case ProfileHeap, ProfileAllocs, ProfileGoroutine:
 		return 5 * time.Second
 	default:
 		return 10 * time.Second
@@ -141,6 +149,32 @@ func DefaultInterval(pt ProfileType) time.Duration {
 // Detect returns true if the argument looks like an HTTP URL.
 func Detect(arg string) bool {
 	return strings.HasPrefix(arg, "http://") || strings.HasPrefix(arg, "https://")
+}
+
+func parseGoroutineProfile(r io.Reader) (*profile.Profile, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("read goroutine data: %w", err)
+	}
+	goroutines, err := profile.ParseGoroutineText(data)
+	if err != nil {
+		return nil, fmt.Errorf("parse goroutine text: %w", err)
+	}
+	if len(goroutines) == 0 {
+		return nil, fmt.Errorf("no goroutines found in response")
+	}
+
+	synthetic := profile.BuildSyntheticProfile(goroutines)
+	sampleType := ""
+	if len(synthetic.SampleType) > 0 {
+		sampleType = synthetic.SampleType[len(synthetic.SampleType)-1].Type
+	}
+
+	return &profile.Profile{
+		Raw:        synthetic,
+		SampleType: sampleType,
+		Goroutines: goroutines,
+	}, nil
 }
 
 func parseProfile(r io.Reader) (*profile.Profile, error) {
