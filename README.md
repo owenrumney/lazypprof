@@ -27,6 +27,16 @@ lazypprof http://localhost:6060 goroutine    # goroutines (with state filtering)
 lazypprof -interval 3s http://localhost:6060 heap
 ```
 
+## Demo
+
+### File profile
+
+<video src=".github/images/cpu_file.mp4" controls width="100%"></video>
+
+### Live service
+
+<video src=".github/images/live.mp4" controls width="100%"></video>
+
 ## Views
 
 **Top** — functions ranked by cumulative value. Standard pprof top view.
