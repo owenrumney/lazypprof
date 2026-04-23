@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"time"
 
 	pp "github.com/google/pprof/profile"
 )
@@ -13,8 +14,9 @@ import (
 // Profile is a loaded pprof profile plus the currently selected sample type.
 type Profile struct {
 	Raw        *pp.Profile
-	SampleType string       // e.g. "cpu", "inuse_space", "alloc_objects"
-	Goroutines []Goroutine  // populated for goroutine profiles (debug=2 parse)
+	SampleType string      // e.g. "cpu", "inuse_space", "alloc_objects"
+	Goroutines []Goroutine // populated for goroutine profiles (debug=2 parse)
+	FetchedAt  time.Time   // when this profile was fetched (zero for file-loaded profiles)
 }
 
 // Load reads a pprof file (gzipped or not) from disk.

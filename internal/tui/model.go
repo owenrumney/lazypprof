@@ -39,23 +39,27 @@ func (v view) String() string {
 	return "?"
 }
 
-// profileRefreshMsg is sent when a new profile arrives from live mode.
+// profileRefreshMsg is sent when any poller delivers a new profile.
 type profileRefreshMsg struct {
 	prof *profile.Profile
-	gen  uint64 // generation at the time the wait was registered
+	pt   source.ProfileType
 }
 
-// modeSwitchMsg is sent when a mode switch completes (new profile type fetched).
+// modeSwitchMsg is sent when a mode switch completes (first profile fetched for a new type).
 type modeSwitchMsg struct {
-	prof     *profile.Profile
-	refreshC <-chan *profile.Profile
-	cancel   context.CancelFunc
-	pt       source.ProfileType
+	prof *profile.Profile
+	pt   source.ProfileType
 }
 
 // modeSwitchErrMsg is sent when a mode switch fails.
 type modeSwitchErrMsg struct {
 	err error
+}
+
+// pollerState tracks a running poller for a profile type.
+type pollerState struct {
+	refreshC <-chan *profile.Profile
+	cancel   context.CancelFunc
 }
 
 // Model is the root Bubble Tea model.
@@ -69,7 +73,6 @@ type Model struct {
 	tree      treeModel
 	flame     flameModel
 	goroutine goroutineModel
-	refreshC  <-chan *profile.Profile // nil for file mode
 
 	// Filter bar.
 	filtering  bool
@@ -81,16 +84,21 @@ type Model struct {
 	showHelp bool
 
 	// Live mode switching.
-	liveConfig   *LiveConfig
-	pollerCancel context.CancelFunc // cancel current poller
-	refreshGen   uint64             // incremented on mode switch; drops stale refresh messages
-	switching    string             // non-empty = "Switching to <type>..." overlay
-	modePicker   bool               // true = mode picker overlay visible
-	modePickIdx  int                // cursor in AllProfileTypes
+	liveConfig    *LiveConfig
+	pollers       map[source.ProfileType]*pollerState // running pollers keyed by type
+	initialCancel context.CancelFunc                  // cancel for the initial poller; moved into pollers map during New
+	switching     string                              // non-empty = "Switching to <type>..." overlay
+	modePicker    bool                                // true = mode picker overlay visible
+	modePickIdx   int                                 // cursor in AllProfileTypes
 
 	// Pause.
 	paused      bool
 	pendingProf *profile.Profile // latest profile received while paused
+
+	// History (live mode only). One ring buffer per profile type.
+	histories map[source.ProfileType]*profile.History
+	histIdx   int  // current position in active history
+	histLive  bool // true when tracking the latest profile
 
 	// Diff mode.
 	diffMode bool
@@ -129,11 +137,24 @@ func New(p *profile.Profile, refreshC <-chan *profile.Profile, opts ...Option) M
 		tree:      newTreeModel(p),
 		flame:     newFlameModel(p),
 		goroutine: newGoroutineModel(p),
-		refreshC:  refreshC,
 		filterInp: ti,
+		pollers:   make(map[source.ProfileType]*pollerState),
+		histories: make(map[source.ProfileType]*profile.History),
+		histIdx:   -1,
+		histLive:  true,
 	}
 	for _, opt := range opts {
 		opt(&m)
+	}
+	// Register the initial poller if one was provided.
+	if refreshC != nil && m.liveConfig != nil {
+		m.pollers[m.liveConfig.ProfileType] = &pollerState{
+			refreshC: refreshC,
+			cancel:   m.initialCancel,
+		}
+		m.activeHistory().Push(p)
+		m.histIdx = 0
+		m.initialCancel = nil
 	}
 	m.views = m.availableViews()
 	m.view = m.views[0]
@@ -147,7 +168,7 @@ type Option func(*Model)
 func WithLiveConfig(cfg *LiveConfig, cancel context.CancelFunc) Option {
 	return func(m *Model) {
 		m.liveConfig = cfg
-		m.pollerCancel = cancel
+		m.initialCancel = cancel
 	}
 }
 
@@ -167,36 +188,53 @@ func (m *Model) availableViews() []view {
 }
 
 func (m Model) Init() tea.Cmd {
-	if m.refreshC != nil {
-		return m.waitForRefresh()
+	var cmds []tea.Cmd
+	for pt, ps := range m.pollers {
+		if ps.refreshC != nil {
+			cmds = append(cmds, waitForPollerRefresh(ps.refreshC, pt))
+		}
 	}
-	return nil
+	return tea.Batch(cmds...)
 }
 
-func (m Model) waitForRefresh() tea.Cmd {
-	gen := m.refreshGen
-	c := m.refreshC
+// waitForPollerRefresh returns a Cmd that waits for the next profile from a
+// specific poller and wraps it in a profileRefreshMsg tagged with the type.
+func waitForPollerRefresh(c <-chan *profile.Profile, pt source.ProfileType) tea.Cmd {
 	return func() tea.Msg {
 		p, ok := <-c
 		if !ok {
 			return nil
 		}
-		return profileRefreshMsg{prof: p, gen: gen}
+		return profileRefreshMsg{prof: p, pt: pt}
 	}
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case profileRefreshMsg:
-		if msg.gen != m.refreshGen {
-			return m, nil // stale message from a previous mode's poller; discard
+		// Store in the appropriate history regardless of which type is active.
+		h := m.historyFor(msg.pt)
+		h.Push(msg.prof)
+
+		// Re-register the wait for this poller's next delivery.
+		ps := m.pollers[msg.pt]
+		var nextCmd tea.Cmd
+		if ps != nil && ps.refreshC != nil {
+			nextCmd = waitForPollerRefresh(ps.refreshC, msg.pt)
 		}
-		if m.paused {
-			m.pendingProf = msg.prof // stash; apply when resumed
-			return m, m.waitForRefresh()
+
+		// Only update the display if this is the active type.
+		if m.liveConfig != nil && msg.pt == m.liveConfig.ProfileType {
+			if m.paused {
+				m.pendingProf = msg.prof
+				return m, nextCmd
+			}
+			if m.histLive {
+				m.histIdx = h.Len() - 1
+				m.refreshProfile(msg.prof)
+			}
 		}
-		m.refreshProfile(msg.prof)
-		return m, m.waitForRefresh()
+		return m, nextCmd
 
 	case modeSwitchErrMsg:
 		m.switching = ""
@@ -204,17 +242,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case modeSwitchMsg:
 		m.switching = ""
-		m.refreshGen++ // invalidate any in-flight profileRefreshMsg from old poller
-		// Cancel old poller, wire up new one.
-		if m.pollerCancel != nil {
-			m.pollerCancel()
-		}
-		m.pollerCancel = msg.cancel
-		m.refreshC = msg.refreshC
 		m.liveConfig.ProfileType = msg.pt
 		m.prof = msg.prof
+		m.activeHistory().Push(msg.prof)
+		m.histIdx = m.activeHistory().Len() - 1
+		m.histLive = true
 		m.rebuildViews()
-		return m, m.waitForRefresh()
+
+		// Start a poller for this type (first visit).
+		return m, m.startPoller(msg.pt)
 
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -262,12 +298,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.showHelp = true
 			return m, nil
 		case "p":
-			if m.refreshC != nil {
+			if m.liveConfig != nil {
 				m.paused = !m.paused
 				if !m.paused && m.pendingProf != nil {
 					m.refreshProfile(m.pendingProf)
 					m.pendingProf = nil
+					m.histIdx = m.activeHistory().Len() - 1
+					m.histLive = true
 				}
+				return m, nil
+			}
+		case "[":
+			if m.activeHistory().Len() > 1 {
+				m.historyBack()
+				return m, nil
+			}
+		case "]":
+			if m.activeHistory().Len() > 1 {
+				m.historyForward()
 				return m, nil
 			}
 		case "m":
@@ -381,8 +429,11 @@ func (m Model) View() string {
 		extras = append(extras, "diff")
 	} else if m.liveConfig != nil {
 		extras = append(extras, "live:"+string(m.liveConfig.ProfileType))
-	} else if m.refreshC != nil {
-		extras = append(extras, "live")
+	}
+	if m.activeHistory().Len() > 1 && !m.histLive {
+		snap := m.activeHistory().At(m.histIdx)
+		extras = append(extras, fmt.Sprintf("[%d/%d] %s",
+			m.histIdx+1, m.activeHistory().Len(), snap.Time.Format(time.TimeOnly)))
 	}
 	if m.filterText != "" {
 		extras = append(extras, "filter: "+m.filterText)
@@ -392,11 +443,8 @@ func (m Model) View() string {
 		extraStr = " │ " + strings.Join(extras, " │ ")
 	}
 	keys := "[tab] [/] [?] [q]"
-	if m.refreshC != nil {
-		keys = "[tab] [p] [/] [?] [q]"
-	}
 	if m.liveConfig != nil {
-		keys = "[tab] [m] [p] [/] [?] [q]"
+		keys = "[tab] [m] [p] [[] []] [/] [?] [q]"
 	}
 	header := headerStyle.Render(fmt.Sprintf(
 		" lazypprof │ %s │ %s (%s)%s │ %s ",
@@ -541,6 +589,50 @@ func (m *Model) refreshProfile(p *profile.Profile) {
 	m.rebuildViews()
 }
 
+// activeHistory returns the history buffer for the current profile type.
+func (m *Model) activeHistory() *profile.History {
+	if m.liveConfig == nil {
+		return m.historyFor("")
+	}
+	return m.historyFor(m.liveConfig.ProfileType)
+}
+
+// historyFor returns the history buffer for a specific profile type,
+// creating it on first access.
+func (m *Model) historyFor(pt source.ProfileType) *profile.History {
+	h, ok := m.histories[pt]
+	if !ok {
+		h = profile.NewHistory(100)
+		m.histories[pt] = h
+	}
+	return h
+}
+
+func (m *Model) historyBack() {
+	if m.histIdx <= 0 {
+		return
+	}
+	m.histLive = false
+	m.histIdx--
+	snap := m.activeHistory().At(m.histIdx)
+	m.refreshProfile(snap.Prof)
+}
+
+func (m *Model) historyForward() {
+	if m.histIdx >= m.activeHistory().Len()-1 {
+		// Snap back to live tracking.
+		m.histLive = true
+		m.histIdx = m.activeHistory().Len() - 1
+		return
+	}
+	m.histIdx++
+	if m.histIdx == m.activeHistory().Len()-1 {
+		m.histLive = true
+	}
+	snap := m.activeHistory().At(m.histIdx)
+	m.refreshProfile(snap.Prof)
+}
+
 func (m *Model) rebuildViews() {
 	if m.filterRe != nil {
 		m.topTbl = newTopTableFiltered(m.prof, m.filterRe)
@@ -609,6 +701,17 @@ func (m *Model) updateModePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if selected == m.liveConfig.ProfileType {
 			return m, nil // no change
 		}
+		// If we already have a poller with history for this type, switch instantly.
+		if ps := m.pollers[selected]; ps != nil && m.historyFor(selected).Len() > 0 {
+			m.liveConfig.ProfileType = selected
+			h := m.activeHistory()
+			snap := h.Latest()
+			m.prof = snap.Prof
+			m.histIdx = h.Len() - 1
+			m.histLive = true
+			m.rebuildViews()
+			return m, nil
+		}
 		m.switching = fmt.Sprintf("Switching to %s...", selected)
 		return m, m.switchModeTo(selected)
 	case "esc", "escape", "q", "m":
@@ -628,21 +731,27 @@ func (m *Model) switchModeTo(pt source.ProfileType) tea.Cmd {
 			return modeSwitchErrMsg{err: err}
 		}
 
-		interval := cfg.Interval
-		if interval == 0 {
-			interval = source.DefaultInterval(pt)
-		}
-		poller := source.NewPoller(httpSrc, interval)
-		ctx, cancel := context.WithCancel(context.Background())
-		go poller.Run(ctx)
-
 		return modeSwitchMsg{
-			prof:     prof,
-			refreshC: poller.C,
-			cancel:   cancel,
-			pt:       pt,
+			prof: prof,
+			pt:   pt,
 		}
 	}
+}
+
+// startPoller creates and registers a new poller for the given profile type.
+// Returns a Cmd that listens for its first delivery.
+func (m *Model) startPoller(pt source.ProfileType) tea.Cmd {
+	cfg := m.liveConfig
+	interval := cfg.Interval
+	if interval == 0 {
+		interval = source.DefaultInterval(pt)
+	}
+	httpSrc := source.NewHTTPSource(cfg.BaseURL, pt)
+	poller := source.NewPoller(httpSrc, interval)
+	ctx, cancel := context.WithCancel(context.Background())
+	go poller.Run(ctx)
+	m.pollers[pt] = &pollerState{refreshC: poller.C, cancel: cancel}
+	return waitForPollerRefresh(poller.C, pt)
 }
 
 func (m Model) modePickerView() string {

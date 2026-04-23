@@ -37,6 +37,11 @@ func (m Model) helpView() string {
 	}
 	if m.liveConfig != nil {
 		globalKeys = append([]helpEntry{
+			{"[ / ]", "Step back / forward through profile history"},
+		}, globalKeys...)
+	}
+	if m.liveConfig != nil {
+		globalKeys = append([]helpEntry{
 			{"m", "Switch profile type (cpu/heap/allocs/goroutine)"},
 			{"p", "Pause/resume live refresh"},
 		}, globalKeys...)

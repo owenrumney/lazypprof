@@ -89,10 +89,17 @@ func (s *HTTPSource) Load() (*profile.Profile, error) {
 		return nil, fmt.Errorf("http %d from %s", resp.StatusCode, s.URL)
 	}
 
+	var prof *profile.Profile
 	if s.ProfileType == ProfileGoroutine {
-		return parseGoroutineProfile(resp.Body)
+		prof, err = parseGoroutineProfile(resp.Body)
+	} else {
+		prof, err = parseProfile(resp.Body)
 	}
-	return parseProfile(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	prof.FetchedAt = time.Now()
+	return prof, nil
 }
 
 // Poller periodically fetches profiles from an HTTPSource and delivers them
