@@ -8,6 +8,13 @@ A keyboard-driven TUI for exploring Go pprof profiles. Faster than `go tool ppro
 go install github.com/owenrumney/lazypprof/cmd/lazypprof@latest
 ```
 
+### Homebrew
+
+```bash
+brew tap owenrumney/tools
+brew install --cask lazypprof
+```
+
 Or grab a binary from [Releases](https://github.com/owenrumney/lazypprof/releases).
 
 ## Usage
