@@ -65,6 +65,8 @@ Profile types: `cpu` (default), `heap`, `allocs`, `goroutine`, `mutex`, `block`
 | `s`   | Cycle sample type               |
 | `/`   | Filter by function name (regex) |
 | `esc` | Clear filter                    |
+| `[`   | Step back through history        |
+| `]`   | Step forward through history     |
 | `p`   | Pause/resume live updates       |
 | `m`   | Switch profile type (live mode) |
 | `?`   | Help overlay                    |
