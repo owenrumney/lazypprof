@@ -34,6 +34,18 @@ type HTTPSource struct {
 	URL         string
 	Client      *http.Client
 	ProfileType ProfileType
+	CPUSeconds  int
+	Headers     http.Header
+	Username    string
+	Password    string
+}
+
+// HTTPConfig holds live HTTP source options.
+type HTTPConfig struct {
+	Interval time.Duration
+	Headers  http.Header
+	Username string
+	Password string
 }
 
 // ProfileType selects which pprof endpoint to hit.
@@ -49,7 +61,7 @@ const (
 )
 
 // pprofPath returns the /debug/pprof/... path for a profile type.
-func (pt ProfileType) pprofPath() string {
+func (pt ProfileType) pprofPath(cpuSeconds int) string {
 	switch pt {
 	case ProfileHeap:
 		return "/debug/pprof/heap"
@@ -62,24 +74,76 @@ func (pt ProfileType) pprofPath() string {
 	case ProfileBlock:
 		return "/debug/pprof/block"
 	default:
-		return "/debug/pprof/profile?seconds=5"
+		if cpuSeconds <= 0 {
+			cpuSeconds = 5
+		}
+		return fmt.Sprintf("/debug/pprof/profile?seconds=%d", cpuSeconds)
 	}
 }
 
 // NewHTTPSource creates an HTTPSource for the given base URL and profile type.
 func NewHTTPSource(baseURL string, pt ProfileType) *HTTPSource {
+	return NewHTTPSourceWithInterval(baseURL, pt, 0)
+}
+
+// NewHTTPSourceWithInterval creates an HTTPSource whose CPU capture duration
+// follows the requested poll interval. Non-CPU profile URLs are unaffected.
+func NewHTTPSourceWithInterval(baseURL string, pt ProfileType, interval time.Duration) *HTTPSource {
+	return NewHTTPSourceWithConfig(baseURL, pt, HTTPConfig{Interval: interval})
+}
+
+// NewHTTPSourceWithConfig creates an HTTPSource for a live pprof endpoint.
+func NewHTTPSourceWithConfig(baseURL string, pt ProfileType, cfg HTTPConfig) *HTTPSource {
 	base := strings.TrimRight(baseURL, "/")
+	cpuSeconds := cpuSecondsForInterval(cfg.Interval)
 	return &HTTPSource{
-		URL:         base + pt.pprofPath(),
+		URL:         base + pt.pprofPath(cpuSeconds),
 		ProfileType: pt,
+		CPUSeconds:  cpuSeconds,
+		Headers:     cloneHeader(cfg.Headers),
+		Username:    cfg.Username,
+		Password:    cfg.Password,
 		Client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
 	}
 }
 
+func cloneHeader(h http.Header) http.Header {
+	if h == nil {
+		return nil
+	}
+	return h.Clone()
+}
+
+func cpuSecondsForInterval(interval time.Duration) int {
+	if interval <= 0 {
+		return 5
+	}
+	if interval < time.Second {
+		return 1
+	}
+	if interval > 30*time.Second {
+		return 30
+	}
+	return int(interval / time.Second)
+}
+
 func (s *HTTPSource) Load() (*profile.Profile, error) {
-	resp, err := s.Client.Get(s.URL)
+	req, err := http.NewRequest(http.MethodGet, s.URL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("new request: %w", err)
+	}
+	for name, values := range s.Headers {
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
+	}
+	if s.Username != "" || s.Password != "" {
+		req.SetBasicAuth(s.Username, s.Password)
+	}
+
+	resp, err := s.Client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("http get: %w", err)
 	}
@@ -107,7 +171,14 @@ func (s *HTTPSource) Load() (*profile.Profile, error) {
 type Poller struct {
 	Source   *HTTPSource
 	Interval time.Duration
-	C        chan *profile.Profile // new profiles arrive here
+	C        chan PollEvent // new profiles and refresh errors arrive here
+}
+
+// PollEvent reports the outcome of one poll attempt.
+type PollEvent struct {
+	Profile *profile.Profile
+	Err     error
+	At      time.Time
 }
 
 // NewPoller creates a Poller that fetches from src every interval.
@@ -115,7 +186,7 @@ func NewPoller(src *HTTPSource, interval time.Duration) *Poller {
 	return &Poller{
 		Source:   src,
 		Interval: interval,
-		C:        make(chan *profile.Profile, 1),
+		C:        make(chan PollEvent, 1),
 	}
 }
 
@@ -126,27 +197,24 @@ func (p *Poller) Run(ctx context.Context) {
 	defer close(p.C)
 
 	// Fetch immediately on start.
-	if prof, err := p.Source.Load(); err == nil {
-		select {
-		case p.C <- prof:
-		default:
-		}
-	}
+	p.deliver()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			prof, err := p.Source.Load()
-			if err != nil {
-				continue // keep showing the previous profile
-			}
-			select {
-			case p.C <- prof:
-			default:
-			}
+			p.deliver()
 		}
+	}
+}
+
+func (p *Poller) deliver() {
+	prof, err := p.Source.Load()
+	ev := PollEvent{Profile: prof, Err: err, At: time.Now()}
+	select {
+	case p.C <- ev:
+	default:
 	}
 }
 

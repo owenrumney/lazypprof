@@ -52,6 +52,8 @@ func (m Model) helpView() string {
 	case viewTop:
 		section("Top View", []helpEntry{
 			{"j/k ↑/↓", "Navigate rows"},
+			{"c / f / n", "Sort by cumulative / flat / name"},
+			{"enter / l", "Open source view for selected function"},
 		})
 	case viewTree:
 		section("Tree View", []helpEntry{
@@ -61,11 +63,13 @@ func (m Model) helpView() string {
 			{"space", "Toggle expand/collapse"},
 			{"*", "Expand subtree"},
 			{"0", "Collapse all"},
+			{"shift+l", "Open source view for selected function"},
 		})
 	case viewFlame:
 		section("Flame Graph", []helpEntry{
 			{"h/j/k/l ←↓↑→", "Navigate frames"},
 			{"enter", "Zoom into frame"},
+			{"shift+l", "Open source view for selected frame"},
 			{"backspace", "Zoom out"},
 			{"0", "Reset zoom"},
 		})
@@ -75,6 +79,10 @@ func (m Model) helpView() string {
 			{"g", "Cycle state filter"},
 			{"enter", "Drill into state (unique stacks)"},
 			{"backspace", "Back to state groups"},
+		})
+	case viewSource:
+		section("Source", []helpEntry{
+			{"j/k ↑/↓", "Navigate hot lines"},
 		})
 	}
 

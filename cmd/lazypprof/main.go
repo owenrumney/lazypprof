@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -18,6 +19,11 @@ import (
 func main() {
 	interval := flag.Duration("interval", 0, "poll interval for live mode (e.g. 5s, 10s); 0 = auto")
 	profileType := flag.String("type", "cpu", "profile type: cpu, heap, allocs, goroutine, mutex, block")
+	headers := headerFlags{}
+	flag.Var(&headers, "H", "HTTP header for live mode, in 'Name: value' form; repeatable")
+	flag.Var(&headers, "header", "HTTP header for live mode, in 'Name: value' form; repeatable")
+	username := flag.String("user", "", "basic auth username for live mode")
+	password := flag.String("password", "", "basic auth password for live mode")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: lazypprof [flags] <profile-file | base.prof target.prof | http://host:port>\n\n")
@@ -29,6 +35,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  lazypprof -type heap http://localhost:6060            # live heap\n")
 		fmt.Fprintf(os.Stderr, "  lazypprof -type mutex http://localhost:6060           # live mutex\n")
 		fmt.Fprintf(os.Stderr, "  lazypprof -interval 3s -type allocs http://host:6060  # live allocs, custom interval\n\n")
+		fmt.Fprintf(os.Stderr, "  lazypprof -H 'Authorization: Bearer token' https://host:6060\n")
+		fmt.Fprintf(os.Stderr, "  lazypprof -user alice -password \"$TOKEN\" https://host:6060\n\n")
 		fmt.Fprintf(os.Stderr, "Profile types: cpu (default), heap, allocs, goroutine, mutex, block\n")
 		fmt.Fprintf(os.Stderr, "Press [m] in live mode to switch between profile types.\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
@@ -37,11 +45,17 @@ func main() {
 	flag.Parse()
 
 	pt := parseProfileType(*profileType)
+	auth := source.HTTPConfig{
+		Interval: *interval,
+		Headers:  headers.Header(),
+		Username: *username,
+		Password: *password,
+	}
 
 	if flag.NArg() < 1 {
 		if url := probeLocalhost(); url != "" {
 			fmt.Fprintf(os.Stderr, "no target given; detected service at %s\n", url)
-			runLive(url, pt, *interval)
+			runLive(url, pt, auth)
 			return
 		}
 		flag.Usage()
@@ -58,12 +72,39 @@ func main() {
 				pt = legacy
 			}
 		}
-		runLive(arg, pt, *interval)
+		runLive(arg, pt, auth)
 	} else if flag.NArg() >= 2 && !source.Detect(flag.Arg(1)) {
 		runDiff(arg, flag.Arg(1))
 	} else {
 		runFile(arg)
 	}
+}
+
+type headerFlags []string
+
+func (h *headerFlags) String() string {
+	return strings.Join(*h, ", ")
+}
+
+func (h *headerFlags) Set(value string) error {
+	name, _, ok := strings.Cut(value, ":")
+	if !ok {
+		return fmt.Errorf("header must be in 'Name: value' form")
+	}
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("header name cannot be empty")
+	}
+	*h = append(*h, value)
+	return nil
+}
+
+func (h headerFlags) Header() http.Header {
+	headers := make(http.Header)
+	for _, raw := range h {
+		name, value, _ := strings.Cut(raw, ":")
+		headers.Add(strings.TrimSpace(name), strings.TrimSpace(value))
+	}
+	return headers
 }
 
 // probeLocalhost checks whether a service is accepting TCP connections on
@@ -142,8 +183,8 @@ func runFile(path string) {
 	}
 }
 
-func runLive(baseURL string, pt source.ProfileType, interval time.Duration) {
-	httpSrc := source.NewHTTPSource(baseURL, pt)
+func runLive(baseURL string, pt source.ProfileType, auth source.HTTPConfig) {
+	httpSrc := source.NewHTTPSourceWithConfig(baseURL, pt, auth)
 	fmt.Fprintf(os.Stderr, "fetching from %s ...\n", httpSrc.URL)
 
 	prof, err := httpSrc.Load()
@@ -152,7 +193,7 @@ func runLive(baseURL string, pt source.ProfileType, interval time.Duration) {
 		os.Exit(1)
 	}
 
-	pollInterval := interval
+	pollInterval := auth.Interval
 	if pollInterval == 0 {
 		pollInterval = source.DefaultInterval(pt)
 	}
@@ -164,8 +205,11 @@ func runLive(baseURL string, pt source.ProfileType, interval time.Duration) {
 
 	cfg := &tui.LiveConfig{
 		BaseURL:     baseURL,
-		Interval:    interval, // 0 = auto per type
+		Interval:    auth.Interval, // 0 = auto per type
 		ProfileType: pt,
+		Headers:     auth.Headers,
+		Username:    auth.Username,
+		Password:    auth.Password,
 	}
 
 	model := tui.New(prof, poller.C, tui.WithLiveConfig(cfg, cancel))

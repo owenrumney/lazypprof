@@ -4,6 +4,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"regexp"
 	"strings"
 	"time"
@@ -23,6 +24,7 @@ const (
 	viewTree
 	viewFlame
 	viewGoroutine
+	viewSource
 )
 
 func (v view) String() string {
@@ -35,6 +37,8 @@ func (v view) String() string {
 		return "Flame"
 	case viewGoroutine:
 		return "Goroutines"
+	case viewSource:
+		return "Source"
 	}
 	return "?"
 }
@@ -43,6 +47,8 @@ func (v view) String() string {
 type profileRefreshMsg struct {
 	prof *profile.Profile
 	pt   source.ProfileType
+	err  error
+	at   time.Time
 }
 
 // modeSwitchMsg is sent when a mode switch completes (first profile fetched for a new type).
@@ -58,7 +64,7 @@ type modeSwitchErrMsg struct {
 
 // pollerState tracks a running poller for a profile type.
 type pollerState struct {
-	refreshC <-chan *profile.Profile
+	refreshC <-chan source.PollEvent
 	cancel   context.CancelFunc
 }
 
@@ -70,9 +76,11 @@ type Model struct {
 	width     int
 	height    int
 	topTbl    table.Model
+	top       topView
 	tree      treeModel
 	flame     flameModel
 	goroutine goroutineModel
+	source    sourceModel
 
 	// Filter bar.
 	filtering  bool
@@ -103,6 +111,10 @@ type Model struct {
 	// Diff mode.
 	diffMode bool
 	diffTop  diffTopView
+
+	lastFetchAt           time.Time
+	lastSuccessfulFetchAt time.Time
+	lastFetchErr          error
 }
 
 // LiveConfig holds the parameters needed to switch profile types at runtime.
@@ -110,6 +122,9 @@ type LiveConfig struct {
 	BaseURL     string
 	Interval    time.Duration // 0 = auto-select based on ProfileType via source.DefaultInterval
 	ProfileType source.ProfileType
+	Headers     http.Header
+	Username    string
+	Password    string
 }
 
 // AllProfileTypes returns the available types in cycle order.
@@ -125,7 +140,7 @@ var AllProfileTypes = []source.ProfileType{
 // New constructs a Model for the given profile. Pass a non-nil channel for
 // live mode to receive profile updates. Pass a non-nil LiveConfig to enable
 // mode switching with [m].
-func New(p *profile.Profile, refreshC <-chan *profile.Profile, opts ...Option) Model {
+func New(p *profile.Profile, refreshC <-chan source.PollEvent, opts ...Option) Model {
 	ti := textinput.New()
 	ti.Prompt = "/ "
 	ti.Placeholder = "regex filter..."
@@ -133,10 +148,12 @@ func New(p *profile.Profile, refreshC <-chan *profile.Profile, opts ...Option) M
 
 	m := Model{
 		prof:      p,
+		top:       newTopView(p, nil),
 		topTbl:    newTopTable(p),
 		tree:      newTreeModel(p),
 		flame:     newFlameModel(p),
 		goroutine: newGoroutineModel(p),
+		source:    newSourceModel(p, ""),
 		filterInp: ti,
 		pollers:   make(map[source.ProfileType]*pollerState),
 		histories: make(map[source.ProfileType]*profile.History),
@@ -154,6 +171,7 @@ func New(p *profile.Profile, refreshC <-chan *profile.Profile, opts ...Option) M
 		}
 		m.activeHistory().Push(p)
 		m.histIdx = 0
+		m.lastSuccessfulFetchAt = p.FetchedAt
 		m.initialCancel = nil
 	}
 	m.views = m.availableViews()
@@ -182,9 +200,9 @@ func WithDiffMode() Option {
 
 func (m *Model) availableViews() []view {
 	if len(m.prof.Goroutines) > 0 {
-		return []view{viewGoroutine, viewTop, viewTree, viewFlame}
+		return []view{viewGoroutine, viewTop, viewTree, viewFlame, viewSource}
 	}
-	return []view{viewTop, viewTree, viewFlame}
+	return []view{viewTop, viewTree, viewFlame, viewSource}
 }
 
 func (m Model) Init() tea.Cmd {
@@ -199,22 +217,41 @@ func (m Model) Init() tea.Cmd {
 
 // waitForPollerRefresh returns a Cmd that waits for the next profile from a
 // specific poller and wraps it in a profileRefreshMsg tagged with the type.
-func waitForPollerRefresh(c <-chan *profile.Profile, pt source.ProfileType) tea.Cmd {
+func waitForPollerRefresh(c <-chan source.PollEvent, pt source.ProfileType) tea.Cmd {
 	return func() tea.Msg {
-		p, ok := <-c
+		ev, ok := <-c
 		if !ok {
 			return nil
 		}
-		return profileRefreshMsg{prof: p, pt: pt}
+		return profileRefreshMsg{prof: ev.Profile, pt: pt, err: ev.Err, at: ev.At}
 	}
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case profileRefreshMsg:
+		if m.liveConfig != nil && msg.pt == m.liveConfig.ProfileType {
+			m.lastFetchAt = msg.at
+			m.lastFetchErr = msg.err
+		}
+
+		if msg.err != nil || msg.prof == nil {
+			ps := m.pollers[msg.pt]
+			if ps != nil && ps.refreshC != nil {
+				return m, waitForPollerRefresh(ps.refreshC, msg.pt)
+			}
+			return m, nil
+		}
+
 		// Store in the appropriate history regardless of which type is active.
 		h := m.historyFor(msg.pt)
 		h.Push(msg.prof)
+		if m.liveConfig != nil && msg.pt == m.liveConfig.ProfileType {
+			m.lastSuccessfulFetchAt = msg.prof.FetchedAt
+			if m.lastSuccessfulFetchAt.IsZero() {
+				m.lastSuccessfulFetchAt = msg.at
+			}
+		}
 
 		// Re-register the wait for this poller's next delivery.
 		ps := m.pollers[msg.pt]
@@ -244,6 +281,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.switching = ""
 		m.liveConfig.ProfileType = msg.pt
 		m.prof = msg.prof
+		m.lastFetchErr = nil
+		m.lastSuccessfulFetchAt = msg.prof.FetchedAt
+		if m.lastSuccessfulFetchAt.IsZero() {
+			m.lastSuccessfulFetchAt = time.Now()
+		}
 		m.activeHistory().Push(msg.prof)
 		m.histIdx = m.activeHistory().Len() - 1
 		m.histLive = true
@@ -254,12 +296,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		m.top.setSize(msg.Width-2, msg.Height-4)
 		m.topTbl.SetWidth(msg.Width - 2)
 		m.topTbl.SetHeight(msg.Height - 4)
 		m.diffTop.setSize(msg.Width-2, msg.Height-4)
 		m.tree.setSize(msg.Width-2, msg.Height-4)
 		m.flame.setSize(msg.Width-2, msg.Height-4)
 		m.goroutine.setSize(msg.Width-2, msg.Height-4)
+		m.source.setSize(msg.Width-2, msg.Height-4)
 		return m, nil
 
 	case tea.KeyMsg:
@@ -342,6 +386,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.handleDiffTopKey(msg)
 			return m, nil
 		}
+		if m.view == viewTop {
+			m.handleTopKey(msg)
+			return m, nil
+		}
 		if m.view == viewTree {
 			m.handleTreeKey(msg)
 			return m, nil
@@ -352,6 +400,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.view == viewGoroutine {
 			m.handleGoroutineKey(msg)
+			return m, nil
+		}
+		if m.view == viewSource {
+			m.handleSourceKey(msg)
 			return m, nil
 		}
 	}
@@ -392,6 +444,8 @@ func (m *Model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) applyFilter() {
+	m.top = newTopView(m.prof, m.filterRe)
+	m.top.setSize(m.width-2, m.height-4)
 	m.topTbl = newTopTableFiltered(m.prof, m.filterRe)
 	m.topTbl.SetWidth(m.width - 2)
 	m.topTbl.SetHeight(m.height - 4)
@@ -409,6 +463,8 @@ func (m *Model) applyFilter() {
 func (m *Model) clearFilter() {
 	m.filterRe = nil
 	m.filterText = ""
+	m.top = newTopView(m.prof, nil)
+	m.top.setSize(m.width-2, m.height-4)
 	m.topTbl = newTopTable(m.prof)
 	m.topTbl.SetWidth(m.width - 2)
 	m.topTbl.SetHeight(m.height - 4)
@@ -437,6 +493,16 @@ func (m Model) View() string {
 	}
 	if m.filterText != "" {
 		extras = append(extras, "filter: "+m.filterText)
+	}
+	if m.liveConfig != nil {
+		if m.lastFetchErr != nil {
+			extras = append(extras, "update failed: "+m.lastFetchErr.Error())
+		} else if !m.lastSuccessfulFetchAt.IsZero() {
+			extras = append(extras, "updated "+m.lastSuccessfulFetchAt.Format(time.TimeOnly))
+		}
+	}
+	if meta := m.metadataSummary(); meta != "" {
+		extras = append(extras, meta)
 	}
 	extraStr := ""
 	if len(extras) > 0 {
@@ -481,7 +547,7 @@ func (m Model) View() string {
 		if m.diffMode {
 			body = m.diffTop.view()
 		} else {
-			body = m.topTbl.View()
+			body = m.top.view()
 		}
 	case viewTree:
 		body = m.tree.view()
@@ -489,6 +555,8 @@ func (m Model) View() string {
 		body = m.flame.view()
 	case viewGoroutine:
 		body = m.goroutine.view()
+	case viewSource:
+		body = m.source.view()
 	}
 
 	if m.filtering {
@@ -503,12 +571,57 @@ func (m Model) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left, header, body)
 }
 
+func (m Model) metadataSummary() string {
+	if m.prof == nil {
+		return ""
+	}
+	parts := []string{
+		fmt.Sprintf("samples:%s", formatValue(int64(m.prof.SampleCount()), "count")),
+		"total:" + formatValue(m.prof.TotalValue(), m.prof.Unit()),
+	}
+	if d := m.prof.Duration(); d > 0 {
+		parts = append(parts, "duration:"+d.String())
+	}
+	if m.liveConfig != nil && m.liveConfig.ProfileType == source.ProfileCPU {
+		seconds := source.NewHTTPSourceWithConfig(m.liveConfig.BaseURL, source.ProfileCPU, source.HTTPConfig{
+			Interval: m.liveConfig.Interval,
+		}).CPUSeconds
+		parts = append(parts, fmt.Sprintf("capture:%ds", seconds))
+	}
+	return strings.Join(parts, " ")
+}
+
 func (m *Model) handleDiffTopKey(msg tea.KeyMsg) {
 	switch msg.String() {
 	case "up", "k":
 		m.diffTop.moveUp()
 	case "down", "j":
 		m.diffTop.moveDown()
+	case "c":
+		m.diffTop.setSort(topSortCum)
+	case "f":
+		m.diffTop.setSort(topSortFlat)
+	case "n":
+		m.diffTop.setSort(topSortName)
+	case "enter", "l":
+		m.openSourceFor(m.diffTop.selectedFunction())
+	}
+}
+
+func (m *Model) handleTopKey(msg tea.KeyMsg) {
+	switch msg.String() {
+	case "up", "k":
+		m.top.moveUp()
+	case "down", "j":
+		m.top.moveDown()
+	case "c":
+		m.top.setSort(topSortCum)
+	case "f":
+		m.top.setSort(topSortFlat)
+	case "n":
+		m.top.setSort(topSortName)
+	case "enter", "l":
+		m.openSourceFor(m.top.selectedFunction())
 	}
 }
 
@@ -520,6 +633,8 @@ func (m *Model) handleTreeKey(msg tea.KeyMsg) {
 		m.tree.moveDown()
 	case "right", "l", "enter":
 		m.tree.expand()
+	case "L":
+		m.openSourceFor(m.tree.selectedFunction())
 	case "left", "h":
 		m.tree.collapse()
 	case " ":
@@ -568,11 +683,31 @@ func (m *Model) handleFlameKey(msg tea.KeyMsg) {
 		m.flame.moveUp()
 	case "enter":
 		m.flame.zoomIn()
+	case "L":
+		m.openSourceFor(m.flame.selectedFunction())
 	case "backspace":
 		m.flame.zoomOut()
 	case "0":
 		m.flame.zoomReset()
 	}
+}
+
+func (m *Model) handleSourceKey(msg tea.KeyMsg) {
+	switch msg.String() {
+	case "up", "k":
+		m.source.moveUp()
+	case "down", "j":
+		m.source.moveDown()
+	}
+}
+
+func (m *Model) openSourceFor(function string) {
+	if function == "" {
+		return
+	}
+	m.source = newSourceModel(m.prof, function)
+	m.source.setSize(m.width-2, m.height-4)
+	m.view = viewSource
 }
 
 func (m *Model) refreshProfile(p *profile.Profile) {
@@ -635,10 +770,13 @@ func (m *Model) historyForward() {
 
 func (m *Model) rebuildViews() {
 	if m.filterRe != nil {
+		m.top = newTopView(m.prof, m.filterRe)
 		m.topTbl = newTopTableFiltered(m.prof, m.filterRe)
 	} else {
+		m.top = newTopView(m.prof, nil)
 		m.topTbl = newTopTable(m.prof)
 	}
+	m.top.setSize(m.width-2, m.height-4)
 	m.topTbl.SetWidth(m.width - 2)
 	m.topTbl.SetHeight(m.height - 4)
 	m.tree = newTreeModel(m.prof)
@@ -658,6 +796,9 @@ func (m *Model) rebuildViews() {
 	m.goroutine.stateIdx = oldGoroutine.stateIdx
 	m.goroutine.rebuildGroups()
 	m.goroutine.setSize(m.width-2, m.height-4)
+	function := m.source.function
+	m.source = newSourceModel(m.prof, function)
+	m.source.setSize(m.width-2, m.height-4)
 	// Preserve drill-down: re-enter the same state if we were drilled in.
 	if oldGoroutine.drilled {
 		// Find the group matching the old drill state.
@@ -722,10 +863,8 @@ func (m *Model) updateModePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) switchModeTo(pt source.ProfileType) tea.Cmd {
-	cfg := m.liveConfig
-
 	return func() tea.Msg {
-		httpSrc := source.NewHTTPSource(cfg.BaseURL, pt)
+		httpSrc := m.httpSource(pt)
 		prof, err := httpSrc.Load()
 		if err != nil {
 			return modeSwitchErrMsg{err: err}
@@ -746,12 +885,22 @@ func (m *Model) startPoller(pt source.ProfileType) tea.Cmd {
 	if interval == 0 {
 		interval = source.DefaultInterval(pt)
 	}
-	httpSrc := source.NewHTTPSource(cfg.BaseURL, pt)
+	httpSrc := m.httpSource(pt)
 	poller := source.NewPoller(httpSrc, interval)
 	ctx, cancel := context.WithCancel(context.Background())
 	go poller.Run(ctx)
 	m.pollers[pt] = &pollerState{refreshC: poller.C, cancel: cancel}
 	return waitForPollerRefresh(poller.C, pt)
+}
+
+func (m *Model) httpSource(pt source.ProfileType) *source.HTTPSource {
+	cfg := m.liveConfig
+	return source.NewHTTPSourceWithConfig(cfg.BaseURL, pt, source.HTTPConfig{
+		Interval: cfg.Interval,
+		Headers:  cfg.Headers,
+		Username: cfg.Username,
+		Password: cfg.Password,
+	})
 }
 
 func (m Model) modePickerView() string {
