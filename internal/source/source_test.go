@@ -84,9 +84,70 @@ func TestHTTPSource_Load_ServerError(t *testing.T) {
 	assert.Contains(t, err.Error(), "500")
 }
 
+func TestHTTPSource_Load_SendsHeaders(t *testing.T) {
+	profData := buildTestProfileBytes(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "Bearer token", r.Header.Get("Authorization"))
+		assert.Equal(t, []string{"one", "two"}, r.Header.Values("X-Test"))
+		w.Write(profData)
+	}))
+	defer srv.Close()
+
+	headers := make(http.Header)
+	headers.Add("Authorization", "Bearer token")
+	headers.Add("X-Test", "one")
+	headers.Add("X-Test", "two")
+
+	src := source.NewHTTPSourceWithConfig(srv.URL, source.ProfileCPU, source.HTTPConfig{Headers: headers})
+	src.URL = srv.URL
+	src.Client = srv.Client()
+
+	p, err := src.Load()
+	require.NoError(t, err)
+	assert.NotNil(t, p.Raw)
+}
+
+func TestHTTPSource_Load_SendsBasicAuth(t *testing.T) {
+	profData := buildTestProfileBytes(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		assert.True(t, ok)
+		assert.Equal(t, "alice", user)
+		assert.Equal(t, "secret", pass)
+		w.Write(profData)
+	}))
+	defer srv.Close()
+
+	src := source.NewHTTPSourceWithConfig(srv.URL, source.ProfileCPU, source.HTTPConfig{
+		Username: "alice",
+		Password: "secret",
+	})
+	src.URL = srv.URL
+	src.Client = srv.Client()
+
+	p, err := src.Load()
+	require.NoError(t, err)
+	assert.NotNil(t, p.Raw)
+}
+
 func TestNewHTTPSource_CPU(t *testing.T) {
 	src := source.NewHTTPSource("http://localhost:6060", source.ProfileCPU)
-	assert.Contains(t, src.URL, "/debug/pprof/profile")
+	assert.Equal(t, "http://localhost:6060/debug/pprof/profile?seconds=5", src.URL)
+}
+
+func TestNewHTTPSourceWithInterval_CPU(t *testing.T) {
+	src := source.NewHTTPSourceWithInterval("http://localhost:6060", source.ProfileCPU, 3*time.Second)
+	assert.Equal(t, "http://localhost:6060/debug/pprof/profile?seconds=3", src.URL)
+}
+
+func TestNewHTTPSourceWithInterval_CPUClamps(t *testing.T) {
+	src := source.NewHTTPSourceWithInterval("http://localhost:6060", source.ProfileCPU, 500*time.Millisecond)
+	assert.Equal(t, "http://localhost:6060/debug/pprof/profile?seconds=1", src.URL)
+
+	src = source.NewHTTPSourceWithInterval("http://localhost:6060", source.ProfileCPU, time.Minute)
+	assert.Equal(t, "http://localhost:6060/debug/pprof/profile?seconds=30", src.URL)
 }
 
 func TestNewHTTPSource_Heap(t *testing.T) {
@@ -174,11 +235,40 @@ func TestPoller_DeliversProfile(t *testing.T) {
 	go poller.Run(ctx)
 
 	select {
-	case p := <-poller.C:
-		require.NotNil(t, p)
-		assert.NotEmpty(t, p.SampleType)
+	case ev := <-poller.C:
+		require.NoError(t, ev.Err)
+		require.NotNil(t, ev.Profile)
+		assert.NotEmpty(t, ev.Profile.SampleType)
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for profile from poller")
+	}
+}
+
+func TestPoller_DeliversError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	src := &source.HTTPSource{
+		URL:    srv.URL,
+		Client: srv.Client(),
+	}
+
+	poller := source.NewPoller(src, 50*time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	go poller.Run(ctx)
+
+	select {
+	case ev := <-poller.C:
+		require.Error(t, ev.Err)
+		assert.Nil(t, ev.Profile)
+		assert.False(t, ev.At.IsZero())
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for poller error")
 	}
 }
 

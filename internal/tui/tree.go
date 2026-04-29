@@ -25,6 +25,7 @@ type treeModel struct {
 	rows   []treeRow
 	cursor int
 	total  int64
+	unit   string
 
 	// Track which nodes are expanded by identity (pointer).
 	open map[*profile.Node]bool
@@ -45,6 +46,7 @@ func newTreeModel(p *profile.Profile) treeModel {
 	m := treeModel{
 		roots: roots,
 		total: total,
+		unit:  p.Unit(),
 		open:  make(map[*profile.Node]bool),
 	}
 	// Expand roots by default.
@@ -218,6 +220,13 @@ func (m *treeModel) moveDown() {
 	}
 }
 
+func (m *treeModel) selectedFunction() string {
+	if m.cursor < 0 || m.cursor >= len(m.rows) {
+		return ""
+	}
+	return m.rows[m.cursor].node.Func
+}
+
 func (m *treeModel) visibleHeight() int {
 	h := m.height - 2 // leave room for header/footer
 	if h < 1 {
@@ -271,8 +280,8 @@ func (m *treeModel) view() string {
 	// First pass: build lines and find the longest one.
 	type viewLine struct {
 		text      string
-		separator bool           // blank line before this row
-		node      *profile.Node  // for filter highlighting
+		separator bool          // blank line before this row
+		node      *profile.Node // for filter highlighting
 	}
 	lines := make([]viewLine, 0, end-m.offset)
 	maxLen := 0
@@ -295,8 +304,8 @@ func (m *treeModel) view() string {
 		pct := 100 * float64(r.node.Cum) / float64(m.total)
 		name := truncate(r.node.Func, funcWidth-len([]rune(indent)))
 
-		line := fmt.Sprintf("%s%s %8d %5.1f%%  %s",
-			indent, marker, r.node.Cum, pct, name)
+		line := fmt.Sprintf("%s%s %8s %5.1f%%  %s",
+			indent, marker, formatValue(r.node.Cum, m.unit), pct, name)
 
 		if n := len([]rune(line)); n > maxLen {
 			maxLen = n

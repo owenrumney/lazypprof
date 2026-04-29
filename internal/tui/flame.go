@@ -23,6 +23,7 @@ type flameFrame struct {
 type flameModel struct {
 	roots    []*profile.Node
 	total    int64
+	unit     string
 	width    int
 	height   int
 	frames   []flameFrame // all laid-out frames
@@ -38,6 +39,7 @@ func newFlameModel(p *profile.Profile) flameModel {
 	m := flameModel{
 		roots: roots,
 		total: total,
+		unit:  p.Unit(),
 	}
 	return m
 }
@@ -211,6 +213,13 @@ func (m *flameModel) zoomReset() {
 	m.layout()
 }
 
+func (m *flameModel) selectedFunction() string {
+	if m.cursor < 0 || m.cursor >= len(m.frames) {
+		return ""
+	}
+	return m.frames[m.cursor].node.Func
+}
+
 func (m *flameModel) clampCursor() {
 	if len(m.frames) == 0 {
 		m.cursor = 0
@@ -226,14 +235,14 @@ func (m *flameModel) clampCursor() {
 // Flame palette using adaptive colors. Each entry picks from the terminal's
 // base 16 colors so the graph looks reasonable in any theme.
 var flameColors = []lipgloss.AdaptiveColor{
-	{Light: "1", Dark: "9"},   // red / bright red
-	{Light: "3", Dark: "11"},  // yellow / bright yellow
-	{Light: "2", Dark: "10"},  // green / bright green
-	{Light: "6", Dark: "14"},  // cyan / bright cyan
-	{Light: "5", Dark: "13"},  // magenta / bright magenta
-	{Light: "1", Dark: "11"},  // red / bright yellow
-	{Light: "3", Dark: "9"},   // yellow / bright red
-	{Light: "2", Dark: "13"},  // green / bright magenta
+	{Light: "1", Dark: "9"},  // red / bright red
+	{Light: "3", Dark: "11"}, // yellow / bright yellow
+	{Light: "2", Dark: "10"}, // green / bright green
+	{Light: "6", Dark: "14"}, // cyan / bright cyan
+	{Light: "5", Dark: "13"}, // magenta / bright magenta
+	{Light: "1", Dark: "11"}, // red / bright yellow
+	{Light: "3", Dark: "9"},  // yellow / bright red
+	{Light: "2", Dark: "13"}, // green / bright magenta
 }
 
 func funcColor(name string) int {
@@ -380,8 +389,8 @@ func (m *flameModel) view() string {
 	if m.cursor < len(m.frames) {
 		f := m.frames[m.cursor]
 		pct := 100 * float64(f.node.Cum) / float64(m.total)
-		status := fmt.Sprintf(" %s  Self: %d  Cum: %d (%.1f%%)  [enter] zoom  [backspace] back  [0] reset",
-			f.node.Func, f.node.Self, f.node.Cum, pct)
+		status := fmt.Sprintf(" %s  Self: %s  Cum: %s (%.1f%%)  [enter] zoom  [L] source  [backspace] back  [0] reset",
+			f.node.Func, formatValue(f.node.Self, m.unit), formatValue(f.node.Cum, m.unit), pct)
 		b.WriteString(lipgloss.NewStyle().
 			Foreground(accentColor).
 			Bold(true).

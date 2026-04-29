@@ -1,27 +1,27 @@
-# lazypprof — v0.1 Design
+# lazypprof — Design
 
-> Status: draft
-> Scope: v0.1 only
+> Status: current architecture notes
 
 ## Goal
 
 A keyboard-driven TUI for exploring Go pprof profiles. Faster feedback loop than `go tool pprof -http`, usable over SSH, no browser.
 
-## Non-goals (v0.1)
+## Non-goals
 
-- Diff between profiles
-- Source-annotated view
-- Profile types beyond CPU and heap (no goroutine, mutex, block, allocs)
 - Symbol resolution against a binary (rely on what's in the profile)
-- Persistent config / themes
-- Tests as a deliverable (smoke tests only)
+- Remote source fetching
+- Persistent config / themes, for now
 
-## In-scope (v0.1)
+## In-scope
 
 - Load CPU + heap profiles from local files
 - Pull profiles from a live `/debug/pprof` endpoint
-- Three views: **Top**, **Tree**, **Flame**
+- Send live-mode headers and basic auth credentials for protected endpoints
+- Diff between two local profiles
+- Profile types: CPU, heap, allocs, goroutine, mutex, block
+- Views: **Top**, **Tree**, **Flame**, **Goroutines**, **Source**
 - Switch active sample type within a profile (e.g. `inuse_space` ↔ `alloc_space`)
+- Keep live refresh history, show refresh failures, and preserve the previous profile on transient errors
 
 ---
 
@@ -33,11 +33,12 @@ main
      ├─ profile.Profile        ← google/pprof/profile wrapper + aggregations
      ├─ views/top              ← bubbles/table
      ├─ views/tree             ← custom (collapsible)
-     ├─ views/flame            ← custom (canvas render)
+     ├─ views/flame            ← custom terminal render
+     ├─ views/source           ← file/line aggregate + optional local source text
      └─ source/                ← local file | http poller
 ```
 
-Single binary. No daemon. No persisted state in v0.1.
+Single binary. No daemon. No persisted state.
 
 ### Package layout
 
@@ -57,9 +58,11 @@ internal/tui/flame/        # Flame view
 
 ## Data model
 
-`profile.Profile` wraps `*pprof.Profile` plus the **active sample type** (a single string, e.g. `cpu`, `inuse_space`).
+`profile.Profile` wraps `*pprof.Profile` plus the **active sample type** (a single string, e.g. `cpu`, `inuse_space`). Goroutine profiles also carry parsed text goroutine data and a synthetic pprof profile for shared views.
 
-All view-specific aggregations are derived on demand from the active sample type. No cached intermediate state in v0.1 — re-aggregate on switch. Profiles are small enough (<10 MB typical) that this is fine.
+The profile package owns small metadata helpers such as sample count, total value, duration, period, and period unit. The TUI uses these for compact header metadata.
+
+All view-specific aggregations are derived on demand from the active sample type. Profiles are small enough (<10 MB typical) that this is fine for now.
 
 ### Aggregations
 
@@ -68,6 +71,7 @@ All view-specific aggregations are derived on demand from the active sample type
 | Top   | `[]FunctionStat{Name, File, Flat, Cum}`              |
 | Tree  | rooted call graph: `Node{Func, Self, Cum, Children}` |
 | Flame | same as Tree, rendered as nested rectangles          |
+| Source | `[]LineStat{File, Line, Function, Flat, Cum}`       |
 
 Tree and Flame share the same underlying call-graph build. Build once per (profile, sample-type) tuple; invalidate on switch.
 
@@ -83,6 +87,17 @@ Open path → `pprof.Parse` → done. Supports gzipped and raw.
 
 Poll `GET <base>/debug/pprof/profile?seconds=N` (CPU) or `/debug/pprof/heap` (heap) on a configurable interval (default: 10s for CPU, 5s for heap). Replace the active `Profile` on successful fetch; keep showing the previous one on transient failure.
 
+CPU capture duration follows the configured interval when `-interval` is set, clamped to 1s-30s. With automatic interval selection, CPU captures use 5s.
+
+Protected services are supported with repeatable headers and basic auth:
+
+```
+lazypprof -H 'Authorization: Bearer token' https://service.internal:6060
+lazypprof -user alice -password "$TOKEN" https://service.internal:6060
+```
+
+Header values and passwords are not rendered in the TUI.
+
 CLI:
 
 ```
@@ -93,6 +108,10 @@ lazypprof http://localhost:6060/debug/pprof/heap
 Heuristic: if arg starts with `http://` or `https://`, treat as live; else as file.
 
 Rendering policy: don't blow away the user's selection/focus on refresh. Each view is responsible for preserving cursor across data updates (match by function name).
+
+Refresh policy: pollers emit both success and failure events. The TUI displays update failures in the header and keeps rendering the last successful profile.
+
+Metadata policy: the header shows compact profile metadata: sample count, total active value, duration when present, update time in live mode, and CPU capture duration in live CPU mode.
 
 ---
 
@@ -107,7 +126,7 @@ Rendering policy: don't blow away the user's selection/focus on refresh. Each vi
 - Function names truncated to fit column with `…`
 - Percentages computed against `sum(Flat)` for the active sample type
 
-Open question: support sort-by-flat with a keybind? Probably yes, costs nothing.
+Sort keys: `c` cumulative, `f` flat, `n` function name. Repeating the active sort key toggles direction.
 
 ### Tree
 
@@ -182,17 +201,13 @@ No others in v0.1. Resist the urge.
 ## Open questions
 
 1. **Tree roots when there are many entrypoints** — top-K by Cum, or show a "roots" picker first? Lean: top-K with a key to expand the rest.
-2. **Live mode auth** — do we need to support bearer tokens / basic auth on the `/debug/pprof` endpoint? Common in production. Probably defer to v0.2 unless trivial.
-3. **Sample-type default for heap** — currently picks the last one (`inuse_space` for typical heap profiles). Verify this holds across Go versions.
-4. **Flame graph color scheme** — warm palette by default. Add a `--cold` flag or theme later, not v0.1.
-5. **Window too narrow** — flame graph degrades badly under ~80 cols. Show a "resize me" placeholder, or just render and let it be ugly?
+2. **Sample-type default for heap** — currently picks the last one (`inuse_space` for typical heap profiles). Verify this holds across Go versions.
+3. **Flame graph color scheme** — warm palette by default. Add a `--cold` flag or theme later.
+4. **Window too narrow** — flame graph degrades badly under ~80 cols. Show a "resize me" placeholder, or just render and let it be ugly?
 
----
+## Roadmap
 
-## Milestones
-
-- **M1 — Skeleton (done):** Bubble Tea wired, Top view working off file source
-- **M2 — Tree view:** Call graph build + collapsible tree
-- **M3 — Flame view:** Layout + render + focus/zoom
-- **M4 — Live mode:** HTTP poller + state preservation
-- **M5 — Polish:** Filter bar, help overlay, README + demo gif, release
+- Export/non-interactive output for top, diff, flame, and metadata.
+- Persistent preferences for default type, interval, initial view, and sort.
+- Source view improvements, including path remapping and optional remote source lookup.
+- Symbolization against a local binary when profile symbols are incomplete.
