@@ -1,6 +1,6 @@
 module github.com/owenrumney/lazypprof
 
-go 1.22
+go 1.26.10
 
 require (
 	github.com/charmbracelet/bubbles v0.18.0
